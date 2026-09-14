@@ -1,0 +1,140 @@
+﻿<!doctype html>
+<html lang="hy">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Armenia AI Guide — AI օգնական</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f5f7fb;color:#172033;font:15px system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.wrap{max-width:760px;margin:auto;padding:18px}
+.hero,.chat{background:#fff;border:1px solid #e4e8ef;border-radius:22px;padding:20px;box-shadow:0 8px 30px #0000000a}
+.hero{margin-bottom:14px}
+.logo{font-size:28px;font-weight:900}
+.muted{color:#687386;margin-top:6px}
+.messages{height:52vh;overflow:auto;padding:8px 0}
+.msg{max-width:82%;padding:11px 14px;border-radius:16px;margin:8px 0;white-space:pre-wrap;word-break:break-word}
+.ai{background:#eef2f7}
+.me{background:#111827;color:#fff;margin-left:auto}
+.composer{display:flex;gap:8px;align-items:flex-end}
+.composer textarea{flex:1;resize:none;border:1px solid #d9dee7;border-radius:14px;padding:12px;font:inherit}
+.btn{border:0;border-radius:13px;padding:12px 15px;background:#111827;color:#fff;font-weight:800;cursor:pointer}
+.status{font-size:13px;color:#687386;margin-top:8px}
+.back{display:inline-block;margin-bottom:12px;color:#172033;text-decoration:none;font-weight:700}
+@media(max-width:600px){
+ .wrap{padding:10px}
+ .messages{height:58vh}
+ .composer{align-items:stretch}
+ .btn{padding:10px}
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<a class="back" href="/">← Armenia AI Guide</a>
+
+<div class="hero">
+  <div class="logo">✦ Armenia AI Guide</div>
+  <div class="muted">AI CONCIERGE · Ձեր անձնական AI օգնականը</div>
+</div>
+
+<div class="chat">
+  <div id="messages" class="messages">
+    <div class="msg ai">Բարև 👋 Պատմեք, ինչ ծառայություն եք փնտրում, և ես կօգնեմ գտնել համապատասխան տարբերակներ Հայաստանում։</div>
+  </div>
+
+  <div class="composer">
+    <textarea id="text" rows="2" placeholder="Գրեք ձեր հարցը..."></textarea>
+    <button class="btn" id="sendBtn" onclick="send()">Ուղարկել</button>
+  </div>
+
+  <div id="status" class="status"></div>
+</div>
+
+</div>
+
+<script>
+const tg = window.Telegram && window.Telegram.WebApp;
+
+if (tg) {
+  tg.ready();
+  tg.expand();
+}
+
+const initData = tg ? (tg.initData || '') : '';
+const box = document.getElementById('messages');
+const input = document.getElementById('text');
+const sendBtn = document.getElementById('sendBtn');
+const statusEl = document.getElementById('status');
+
+function escapeHtml(value){
+  return String(value)
+    .replaceAll('&','&amp;')
+    .replaceAll('<','&lt;')
+    .replaceAll('>','&gt;')
+    .replaceAll('"','&quot;')
+    .replaceAll("'","&#039;");
+}
+
+function addMessage(text, type){
+  const div = document.createElement('div');
+  div.className = 'msg ' + type;
+  div.textContent = text;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+
+async function send(){
+  const text = input.value.trim();
+  if (!text) return;
+
+  addMessage(text,'me');
+  input.value = '';
+  sendBtn.disabled = true;
+  statusEl.textContent = 'AI-ը մշակում է հարցումը…';
+
+  try {
+    const response = await fetch('/api/client/ai/chat',{
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json',
+        'X-Telegram-Init-Data':initData
+      },
+      body:JSON.stringify({text:text})
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      if (data.error === 'telegram_init_data_required') {
+        addMessage('AI չաթը հասանելի է Telegram WebApp-ի ներսում։ Բացեք Armenia AI Guide-ը Telegram բոտից։','ai');
+      } else {
+        addMessage(data.error || 'Տեղի ունեցավ սխալ։','ai');
+      }
+      return;
+    }
+
+    addMessage(data.reply || 'Չհաջողվեց ստանալ պատասխանը։','ai');
+
+  } catch(error) {
+    addMessage('Չհաջողվեց կապ հաստատել սերվերի հետ։','ai');
+  } finally {
+    sendBtn.disabled = false;
+    statusEl.textContent = '';
+    input.focus();
+  }
+}
+
+input.addEventListener('keydown',function(e){
+  if(e.key === 'Enter' && !e.shiftKey){
+    e.preventDefault();
+    send();
+  }
+});
+</script>
+
+</body>
+</html>
