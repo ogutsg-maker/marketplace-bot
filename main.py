@@ -27,20 +27,15 @@ from config import (
 from database import DatabaseManager
 from ai_dispatcher import AIDispatcher
 from billing import BillingManager
+from partner_registration_ai import extract as extract_partner_profile, match_subcategories, missing_question
 from telegram_webapp_auth import TelegramWebAppAuthError, validate_telegram_webapp_init_data
 from stage3_partner_verification import register_stage3_routes
-from platform_schema import ensure_platform_schema
-from platform_db import get_partner_by_user, save_partner_document, active_session, update_session
-from partner_ai import PartnerAI
-from admin_ai_api import register_admin_ai_routes
-from client_api import register_client_routes
-from partner_directions_api import register_partner_direction_routes, ensure_initial_partner_direction
 
 try:
     from master_cabinet_api import register_master_cabinet_routes
 except ImportError:
     register_master_cabinet_routes = None
-from states import RegistrationStates, BiddingStates, CodeEntryStates, PartnerAIStates
+from states import RegistrationStates, BiddingStates, CodeEntryStates
 from keyboards import (
     get_role_keyboard, get_language_keyboard, get_city_keyboard,
     get_master_categories_keyboard,
@@ -61,9 +56,7 @@ router = Router()
 dp.include_router(router)
 
 db = DatabaseManager()
-ensure_platform_schema()
 ai = AIDispatcher()
-partner_ai = PartnerAI(ai)
 billing_mgr = BillingManager(db)
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -154,14 +147,6 @@ async def telegram_webapp_auth_middleware(request: web.Request, handler):
 
     status = str(partner.get("status") or "pending")
 
-    if status == "approved" and str(partner.get("verification_status") or "not_submitted") != "approved":
-        return web.json_response({
-            "ok": False,
-            "error": "verification_document_required",
-            "status": status,
-            "verification_status": partner.get("verification_status"),
-        }, status=403)
-
     if status != "approved":
         return web.json_response(
             {
@@ -172,29 +157,6 @@ async def telegram_webapp_auth_middleware(request: web.Request, handler):
             },
             status=403,
         )
-
-    # Service creation is allowed only for an APPROVED partner direction.
-    # This is a backend guard in addition to the frontend dropdown.
-    if request.method == "POST" and tail == "services":
-        try:
-            body = await request.json()
-            category_id = int(body.get("category_id") or 0)
-            if not category_id:
-                return web.json_response({"ok": False, "error": "invalid_category_id"}, status=400)
-        except Exception:
-            return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
-        try:
-            from partner_directions_api import _fetchone
-            category = _fetchone("SELECT master_category_id FROM categories WHERE id=%s AND is_active=TRUE", (category_id,))
-            approved = category and _fetchone(
-                "SELECT id FROM partner_directions WHERE partner_id=%s AND master_category_id=%s AND status='approved'",
-                (partner.get("id"), category["master_category_id"]),
-            )
-            if not approved:
-                return web.json_response({"ok": False, "error": "direction_not_approved", "message": "Услугу можно создать только по одобренному направлению партнёра."}, status=403)
-        except Exception:
-            logger.exception("Partner direction ownership check failed")
-            return web.json_response({"ok": False, "error": "direction_check_failed"}, status=500)
 
     return await handler(request)
 
@@ -285,10 +247,8 @@ async def api_partner_register(request: web.Request):
         "ok": True,
         "registered": True,
         "status": "pending",
-        "verification_status": "not_submitted",
-        "document_required": True,
         "partner_id": partner_id,
-        "message": "Տվյալները պահպանվել են։ Հաստատման փաստաթուղթը պարտադիր է։",
+        "message": "Դիմումը ուղարկված է ադմինիստրատորի ստուգմանը։",
     })
 
 
@@ -369,20 +329,6 @@ async def cmd_reset(message: types.Message, state: FSMContext):
 # 1. РЕГИСТРАЦИЯ И /START
 # ═══════════════════════════════════════════════════════════════
 
-def partner_is_approved(uid: int) -> bool:
-    try:
-        p = db.get_partner_by_user(uid)
-        return bool(p and str(p.get("status") or "") == "approved" and str(p.get("verification_status") or "") == "approved")
-    except Exception:
-        logger.exception("partner approval lookup failed: %s", uid)
-        return False
-
-def partner_cabinet_markup():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🤝 Բացել գործընկերոջ սենյակը", web_app=WebAppInfo(url=f"{WEBAPP_BASE_URL}/master_cabinet.html"))
-    builder.adjust(1)
-    return builder.as_markup()
-
 @router.message(CommandStart())
 async def cmd_start(message: types.Message, command: CommandObject, state: FSMContext):
     uid = message.from_user.id
@@ -425,26 +371,13 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
         role = user["role"]
         lang = user.get("lang", "hy")
         if role == "master":
-            if not partner_is_approved(uid):
-                await state.set_state(PartnerAIStates.onboarding)
-                p = db.get_partner_by_user(uid)
-                status = (p or {}).get("status") or "draft"
-                verification = (p or {}).get("verification_status") or "not_submitted"
-                await message.answer(
-                    t(lang,
-                      f"⏳ Գործընկերոջ ընթացիկ վիճակը՝ {status} / {verification}.\n\n",
-                      f"⏳ Текущий статус партнёра: {status} / {verification}.\n\n",
-                      f"⏳ Current partner status: {status} / {verification}.\n\n") + await partner_ai.initial_message(uid, lang),
-                    reply_markup=partner_cabinet_markup(),
-                )
-            else:
-                await message.answer(
-                    t(lang,
-                      "Բարի գալուստ, Գործընկեր: 🛠️\nՁեր հաշիվը հաստատված է։",
-                      "Добро пожаловать, партнёр! 🛠️\nВаш аккаунт подтверждён.",
-                      "Welcome, partner! 🛠️\nYour account is approved."),
-                    reply_markup=get_master_menu_keyboard(),
-                )
+            await message.answer(
+                t(lang,
+                  "Բարի գալուստ, Վարպետ: 🛠️\nԴուք պատրաստ եք պատվերներ ընդունել:",
+                  "Добро пожаловать, Мастер! 🛠️\nВы готовы принимать заказы.",
+                  "Welcome, Master! 🛠️\nYou are ready to accept orders."),
+                reply_markup=get_master_menu_keyboard(),
+            )
         else:
             await message.answer(
                 t(lang,
@@ -492,109 +425,130 @@ async def process_role(callback: types.CallbackQuery, state: FSMContext):
             t(lang,
               "🎉 Դուք հաճախորդ եք: Նկարագրեք ձեր խնդիրը, և ԻԻ-ն կգտնի վարպետին:",
               "🎉 Вы — Клиент. Опишите задачу, и ИИ найдёт мастера!",
-              "🎉 You are a Client. Describe your task and AI will find a master!"),
+              "🎉 You are a Client. Describe your task, and AI will find a provider!"),
         )
     elif chosen == "master":
         db.update_user_field(uid, "role", "master")
-        await state.set_state(PartnerAIStates.onboarding)
-        await callback.message.edit_text(await partner_ai.initial_message(uid, lang))
+        await state.set_state(RegistrationStates.choosing_city)
+        await state.update_data(partner_onboarding_history=[])
+        await callback.message.edit_text(
+            t(lang,
+              "🏢 Գրանցենք ձեր բիզնեսը։ Պատմեք ազատ ձևով՝ ինչ բիզնես ունեք, ինչպես է կոչվում, որտեղ է գտնվում, ինչ ծառայություններ եք մատուցում և ինչ գներով։ Ես ինքս կճանաչեմ ուղղությունը, ենթաուղղությունները և ծառայությունները։",
+              "🏢 Давайте зарегистрируем ваш бизнес. Расскажите свободно: как называется бизнес, где находится, чем вы занимаетесь, какие услуги оказываете и сколько они стоят. Я сам определю направление, подкатегории и услуги.",
+              "🏢 Let’s register your business. Tell me naturally what it is called, where it is located, what you offer and your prices. I will determine the direction, subcategories and services."),
+        )
     await callback.answer()
 
 
-
-# --- AI-first partner onboarding ---
-@router.message(PartnerAIStates.onboarding, F.text)
-async def partner_ai_text(message: types.Message, state: FSMContext):
-    uid=message.from_user.id
-    user=db.get_user(uid) or {}
-    result=await partner_ai.process(uid,message.text,user.get("lang","hy"))
-    await message.answer(result["reply"])
-
-@router.message(PartnerAIStates.onboarding, F.document)
-async def partner_ai_document(message: types.Message, state: FSMContext):
-    uid=message.from_user.id
-    p=get_partner_by_user(uid)
-    session=active_session(uid,'partner','onboarding')
-    ctx=(session or {}).get('context_json') or {}
-    if isinstance(ctx,str):
-        try: ctx=json.loads(ctx)
-        except Exception: ctx={}
-    direction_id=ctx.get('direction_id')
-    if not p or not direction_id:
-        await message.answer("📌 Նախ պատմեք ձեր բիզնեսի մասին, որպեսզի AI-ն ձևավորի համապատասխան ուղղությունը։")
+async def _partner_onboarding_message(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    user = db.get_user(uid) or {}
+    lang = user.get("lang", "hy")
+    text = (message.text or "").strip()
+    if len(text) < 2:
         return
-    file=await bot.get_file(message.document.file_id)
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        await bot.download_file(file.file_path,tmp.name); tmp_path=tmp.name
-    try:
-        data=Path(tmp_path).read_bytes()
-        if len(data)>10*1024*1024:
-            await message.answer("⚠️ Փաստաթուղթը չափազանց մեծ է։ Առավելագույնը՝ 10 ՄԲ։"); return
-        if (message.document.mime_type or '').lower() == 'application/pdf':
-            try:
-                from pypdf import PdfReader
-                import io
-                reader=PdfReader(io.BytesIO(data))
-                extracted='\n'.join((page.extract_text() or '') for page in reader.pages)
-                if extracted.strip():
-                    result=await ai.analyze_document_content(extracted,user.get('lang','hy'))
-                    add_ai=active_session(uid,'partner','onboarding')
-                    if add_ai:
-                        await partner_ai.process(uid,'Փաստաթղթից ստացված տվյալներ / Данные из документа:\n'+result,user.get('lang','hy'))
-            except Exception:
-                logger.exception('PDF analysis failed')
-        save_partner_document(p['id'],direction_id,message.document.file_name or 'document',message.document.mime_type or 'application/octet-stream',data)
-        ctx['awaiting_document']=False; update_session(session['id'],ctx)
-        await message.answer("✅ Փաստաթուղթը ստացել եմ։ Այն վերլուծվել է AI-ի կողմից և ուղարկվել է ադմինիստրատորի ստուգմանը։")
-    finally:
-        try: os.unlink(tmp_path)
-        except Exception: pass
 
-@router.message(PartnerAIStates.onboarding, F.photo)
-async def partner_ai_photo(message: types.Message, state: FSMContext):
-    uid=message.from_user.id
-    p=get_partner_by_user(uid); session=active_session(uid,'partner','onboarding')
-    ctx=(session or {}).get('context_json') or {}
-    if isinstance(ctx,str):
-        try: ctx=json.loads(ctx)
-        except Exception: ctx={}
-    direction_id=ctx.get('direction_id')
-    if not p or not direction_id:
-        await message.answer("📌 Նախ պատմեք ձեր բիզնեսի մասին, որպեսզի AI-ն ձևավորի համապատասխան ուղղությունը։"); return
-    photo=message.photo[-1]; file=await bot.get_file(photo.file_id)
-    with tempfile.NamedTemporaryFile(delete=False,suffix='.jpg') as tmp:
-        await bot.download_file(file.file_path,tmp.name); tmp_path=tmp.name
-    try:
-        data=Path(tmp_path).read_bytes()
-        analysis=await ai.analyze_image_content(data,'image/jpeg',(db.get_user(uid) or {}).get('lang','hy'))
-        if analysis:
-            await partner_ai.process(uid,'Լուսանկարից ստացված տվյալներ / Данные с фото:\n'+analysis,(db.get_user(uid) or {}).get('lang','hy'))
-        save_partner_document(p['id'],direction_id,'document.jpg','image/jpeg',data)
-        ctx['awaiting_document']=False; update_session(session['id'],ctx)
-        await message.answer("✅ Փաստաթղթի լուսանկարը ստացել եմ, AI-ն վերլուծեց այն և ուղարկել եմ ստուգման։")
-    finally:
-        try: os.unlink(tmp_path)
-        except Exception: pass
+    data = await state.get_data()
+    history = data.get("partner_onboarding_history") or []
+    history.append({"role": "partner", "content": text})
 
-# --- Город (быстрый выбор или текстовый ввод) ---
+    await bot.send_chat_action(uid, "typing")
+    profile = await extract_partner_profile(text, history, db)
+    city_hint = data.get("partner_city_hint")
+    if city_hint and not profile.get("city"):
+        profile["city"] = city_hint
+    await state.update_data(partner_onboarding_history=history, partner_profile=profile)
 
+    if not profile.get("ready"):
+        # If the LLM failed to mark ready but all essential fields are present,
+        # let the deterministic check below decide.
+        essential = all(profile.get(k) for k in ("business_name", "city", "direction")) and bool(profile.get("services"))
+        if not essential:
+            question = missing_question(profile, lang)
+            await message.answer(
+                t(lang,
+                  f"🤖 Ես արդեն հավաքել եմ ձեր ասած տվյալները։ {question}",
+                  f"🤖 Я уже собрал то, что вы рассказали. {question}",
+                  f"🤖 I have collected the information you gave me. {question}"),
+            )
+            return
+
+    name = str(profile.get("business_name") or "").strip()[:200]
+    city = str(profile.get("city") or "").strip()[:200]
+    direction = str(profile.get("direction") or "").strip()[:200]
+    description = str(profile.get("description") or "").strip()
+    services = profile.get("services") or []
+
+    # Persist the structured profile in the existing partner record.
+    partner = db.get_partner_by_user(uid)
+    if partner:
+        partner_id = partner.get("id")
+        db.update_partner(partner_id, business_name=name, business_description=description, status="pending", verification_status="not_submitted")
+    else:
+        partner_id = db.create_partner(uid)
+        db.update_partner(partner_id, business_name=name, business_description=description, status="pending", verification_status="not_submitted")
+
+    db.update_user_field(uid, "city", city)
+
+    # Map AI-selected subcategories into the existing category system.
+    category_ids = match_subcategories(db, profile.get("subcategory_names") or [])
+    if category_ids:
+        try:
+            db.set_master_categories(uid, category_ids)
+        except Exception:
+            logger.exception("Could not save AI-selected partner categories for %s", uid)
+
+    service_lines = []
+    for item in services:
+        if not isinstance(item, dict):
+            continue
+        n = str(item.get("name") or "").strip()
+        if not n:
+            continue
+        price = item.get("price")
+        if price not in (None, ""):
+            service_lines.append(f"• {n} — {price} ֏")
+        else:
+            service_lines.append(f"• {n}")
+
+    summary = [
+        f"🏢 {name}",
+        f"📍 {city}",
+        f"🧭 {direction}",
+    ]
+    if profile.get("district"):
+        summary.append(f"📌 {profile['district']}")
+    if service_lines:
+        summary.append("\n🛠 Ծառայություններ / Услуги:\n" + "\n".join(service_lines[:20]))
+
+    await state.clear()
+    await message.answer(
+        t(lang,
+          "✅ Բիզնեսի տվյալները ճանաչեցի և պահպանեցի։\n\n" + "\n".join(summary) + "\n\n📄 Հաջորդ քայլը՝ բիզնեսը հաստատելու փաստաթուղթը ուղարկեք գործընկերոջ բաժնում։ Հայտը կգնա ադմինիստրատորի ստուգմանը։",
+          "✅ Я распознал и сохранил данные бизнеса.\n\n" + "\n".join(summary) + "\n\n📄 Следующий шаг — отправьте подтверждающий документ в разделе партнёра. Заявка будет передана администратору на проверку.",
+          "✅ I recognized and saved your business information.\n\n" + "\n".join(summary) + "\n\n📄 Next step: upload the verification document in the partner section. Your application will then go to admin review."),
+    )
+
+
+# The old city/category button flow is intentionally kept below for compatibility,
+# but free-form partner onboarding is handled first while choosing_city is active.
 @router.callback_query(RegistrationStates.choosing_city, F.data.startswith("city_"))
 async def process_city_quick(callback: types.CallbackQuery, state: FSMContext):
     city = callback.data.replace("city_", "")
-    uid = callback.from_user.id
-    db.update_user_field(uid, "city", city)
-    await _show_categories_selection(uid, state, callback.message, city)
+    await state.update_data(partner_city_hint=city)
+    lang = (db.get_user(callback.from_user.id) or {}).get("lang", "hy")
+    await callback.message.answer(
+        t(lang,
+          f"📍 Գրանցեցի քաղաքը՝ {city}։ Հիմա պատմեք ձեր բիզնեսի մասին՝ անվանումը, ծառայությունները և գները։",
+          f"📍 Город записал: {city}. Теперь расскажите о бизнесе: название, услуги и цены.",
+          f"📍 City saved: {city}. Now tell me about the business: name, services and prices."),
+    )
     await callback.answer()
 
 
 @router.message(RegistrationStates.choosing_city)
 async def process_city_text(message: types.Message, state: FSMContext):
-    city = message.text.strip()
-    if len(city) < 2:
-        await message.answer("⚠️ Введите корректный город:")
-        return
-    db.update_user_field(message.from_user.id, "city", city)
-    await _show_categories_selection(message.from_user.id, state, message, city)
+    await _partner_onboarding_message(message, state)
 
 
 async def _show_categories_selection(uid: int, state: FSMContext, msg, city: str):
@@ -693,20 +647,14 @@ async def finish_registration(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("⚠️ Выберите хотя бы одну категорию!", show_alert=True)
         return
     db.set_master_categories(uid, selected)
-    # Создаём draft-партнёра сразу, но НЕ считаем регистрацию завершённой.
-    partner_id = db.create_partner(uid)
-    db.update_partner(partner_id, status="draft", verification_status="not_submitted")
-    # Создаём отдельную заявку партнёра на выбранное основное направление.
-    ensure_initial_partner_direction(partner_id, uid)
     await state.clear()
     user = db.get_user(uid)
     lang = (user or {}).get("lang", "hy")
     await callback.message.edit_text(
         t(lang,
-          "📝 Տվյալները պահպանվել են։\n\n📄 Հաջորդ քայլը պարտադիր հաստատման փաստաթուղթն է։\n\nԱռանց փաստաթղթի և ադմինիստրատորի հաստատման պատվերները, վիճակագրությունը և գործընկերոջ լիարժեք գործառույթները փակ են։",
-          "📝 Данные сохранены.\n\n📄 Следующий обязательный шаг — загрузить документ для проверки.\n\nБез документа и одобрения администратора заказы, статистика и полный кабинет партнёра недоступны.",
-          "📝 Your data was saved.\n\n📄 The next required step is uploading a verification document.\n\nOrders, statistics and the full partner cabinet stay locked until document review and admin approval."),
-        reply_markup=partner_cabinet_markup(),
+          "🎉 Գրանցումն ավարտված է: Սպասեք հայտեր:",
+          "🎉 Регистрация завершена! Ожидайте заявки.",
+          "🎉 Registration complete! Await orders."),
     )
     await callback.answer()
 # ═══════════════════════════════════════════════════════════════
@@ -719,10 +667,6 @@ async def handle_my_orders(message: types.Message):
     uid = message.from_user.id
     user = db.get_user(uid)
     lang = (user or {}).get("lang", "hy")
-    if not partner_is_approved(uid):
-        await message.answer("⏳ Գործընկերոջ հայտը դեռ հաստատված չէ ադմինիստրատորի կողմից։")
-        await message.answer("Բացեք գործընկերոջ սենյակը և վերբեռնեք փաստաթուղթը։", reply_markup=partner_cabinet_markup())
-        return
 
     feed = db.get_master_feed(uid)
     if not feed:
@@ -760,10 +704,6 @@ async def handle_history(message: types.Message):
     role = user.get("role", "client")
 
     if role == "master":
-        if not partner_is_approved(uid):
-            await message.answer("⏳ Գործընկերոջ ստուգումը դեռ չի ավարտվել։")
-            await message.answer("Բացեք գործընկերոջ սենյակը։", reply_markup=partner_cabinet_markup())
-            return
         try:
             data = db.get_master_history(uid) or {}
         except Exception as exc:
@@ -941,9 +881,6 @@ async def _process_client_request(message: types.Message, text: str, state: FSMC
 @router.callback_query(F.data.startswith("master_accept_"))
 async def master_accept(callback: types.CallbackQuery, state: FSMContext):
     """Мастер нажимает кнопку 'Откликнуться' на заявке."""
-    if not partner_is_approved(callback.from_user.id):
-        await callback.answer("⏳ Գործընկերոջ հայտը դեռ հաստատված չէ։", show_alert=True)
-        return
     parts = callback.data.split("_")
     order_id = int(parts[2])
     client_id = int(parts[3])
@@ -967,10 +904,6 @@ async def master_skip(callback: types.CallbackQuery):
 @router.message(BiddingStates.awaiting_master_price)
 async def master_enter_price(message: types.Message, state: FSMContext):
     """Мастер вводит цену текстом — AI Groq извлекает сумму в AMD."""
-    if not partner_is_approved(message.from_user.id):
-        await state.clear()
-        await message.answer("⏳ Գործընկերոջ հայտը դեռ հաստատված չէ։", reply_markup=partner_cabinet_markup())
-        return
     data = await state.get_data()
     order_id = data.get("order_id")
     client_id = data.get("client_id")
@@ -1193,9 +1126,6 @@ async def handle_idram_callback(request):
 @router.message(F.text == "📷 Փակել գործարքը / Закрыть сделку")
 async def close_deal_menu(message: types.Message):
     """Меню ручного закрытия безопасной сделки."""
-    if not partner_is_approved(message.from_user.id):
-        await message.answer("⏳ Գործընկերոջ հայտը դեռ հաստատված չէ։", reply_markup=partner_cabinet_markup())
-        return
     await message.answer(
         "🔒 Փակել գործարքը / Закрыть сделку:\n\n"
         "Մուտքագրեք 6-նիշ կոդը կամ օգտագործեք QR-ն:\n"
@@ -1221,10 +1151,6 @@ async def enter_deal_id(message: types.Message, state: FSMContext):
 
 @router.message(CodeEntryStates.entering_secure_code)
 async def enter_secure_code(message: types.Message, state: FSMContext):
-    if not partner_is_approved(message.from_user.id):
-        await state.clear()
-        await message.answer("⏳ Գործընկերոջ հայտը դեռ հաստատված չէ։", reply_markup=partner_cabinet_markup())
-        return
     code = message.text.strip()
     data = await state.get_data()
     deal_id = data.get("deal_id", "")
@@ -1274,9 +1200,6 @@ async def rate_master(callback: types.CallbackQuery):
 async def _handle_master_chat_message(message: types.Message, text: str, state: FSMContext):
     """Анонимный чат: трансляция с модерацией."""
     uid = message.from_user.id
-    if not partner_is_approved(uid):
-        await message.answer("⏳ Գործընկերոջ հայտը դեռ հաստատված չէ։", reply_markup=partner_cabinet_markup())
-        return
     active_chat = db.get_active_chat_for_master(uid)
     if not active_chat:
         await message.answer("⚠️ У вас нет активных чатов.")
@@ -1460,9 +1383,6 @@ async def api_admin_stats(request):
     """GET /api/admin/stats — Безопасная отдача общей операционной и финансовой статистики."""
     try:
         stats = db.get_admin_stats() or {}
-        from platform_db import rows as platform_rows
-        pending_candidates=platform_rows("SELECT COUNT(*) n FROM potential_partners WHERE status IN ('new','researched','ready_for_review','interested','invited')")[0]['n']
-        pending_proposals=platform_rows("SELECT COUNT(*) n FROM ai_catalog_proposals WHERE status IN ('pending','edited','clarification')")[0]['n']
         return web.json_response({
             "total_users": int(stats.get("total_users") or 0),
             "total_masters": int(stats.get("total_masters") or 0),
@@ -1470,9 +1390,7 @@ async def api_admin_stats(request):
             "total_orders": int(stats.get("total_orders") or 0),
             "completed_orders": int(stats.get("completed_orders") or 0),
             "total_commission": float(stats.get("total_commission") or 0),
-            "open_disputes": int(stats.get("open_disputes") or 0),
-            "pending_candidates": int(pending_candidates or 0),
-            "pending_ai_proposals": int(pending_proposals or 0)
+            "open_disputes": int(stats.get("open_disputes") or 0)
         })
     except Exception as e:
         return web.json_response({"total_users":0,"total_masters":0,"verified_masters":0,"total_orders":0,"completed_orders":0,"total_commission":0,"open_disputes":0})
@@ -1512,10 +1430,10 @@ async def api_admin_categories(request):
         return web.json_response([], status=500)
 
 async def api_admin_category_update(request):
-    """POST /api/admin/category/{id} — полное сохранение настроек подкатегории."""
+    """POST /api/admin/category/{id} — Изменение параметров (комиссии, активности) подкатегории."""
     cat_id = int(request.match_info["id"])
     data = await request.json()
-    db.update_category_settings(cat_id, **data)
+    db.update_category(cat_id, **data)
     return web.json_response({"ok": True})
 
 async def api_admin_master_category_create(request):
@@ -1643,12 +1561,6 @@ async def main():
         admin_id=ADMIN_ID,
     )
     logger.info("✅ Stage 3 verification routes registered")
-
-    register_partner_direction_routes(app, db, bot=bot)
-    logger.info("✅ Partner directions routes registered")
-    register_admin_ai_routes(app, ai, bot)
-    register_client_routes(app, ai)
-    logger.info("✅ AI catalog/potential partner/client routes registered")
 
     # New partner cabinet.
     if register_master_cabinet_routes is not None:
