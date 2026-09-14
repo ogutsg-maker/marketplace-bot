@@ -450,13 +450,38 @@ async def _partner_onboarding_message(message: types.Message, state: FSMContext)
 
     data = await state.get_data()
     history = data.get("partner_onboarding_history") or []
-    history.append({"role": "partner", "content": text})
+    pending_field = data.get("partner_onboarding_pending_field")
+    previous_profile = data.get("partner_profile") or {}
+    history.append({"role": "user", "content": text})
 
     await bot.send_chat_action(uid, "typing")
-    profile = await extract_partner_profile(text, history, db)
+    profile = await extract_partner_profile(text, history, db, previous_profile=previous_profile, pending_field=pending_field)
+
+    # Never lose fields already collected in earlier turns.
+    merged = dict(previous_profile)
+    for key, value in (profile or {}).items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    profile = merged
+
+    # If we explicitly asked for one field, the next user message is its answer.
+    if pending_field in {"business_name", "city", "district", "direction"} and text:
+        profile[pending_field] = text.strip()
+    elif pending_field == "services" and text:
+        if not profile.get("services"):
+            profile["services"] = [{"name": text.strip(), "price": None, "price_type": "unknown"}]
     city_hint = data.get("partner_city_hint")
     if city_hint and not profile.get("city"):
         profile["city"] = city_hint
+    # Calculate missing fields ourselves; do not trust an LLM to forget the previous turn.
+    required_missing = []
+    if not profile.get("business_name"): required_missing.append("business_name")
+    if not profile.get("city"): required_missing.append("city")
+    if not profile.get("direction"): required_missing.append("direction")
+    if not profile.get("services"): required_missing.append("services")
+    profile["missing"] = required_missing
+    profile["ready"] = not required_missing
+
     await state.update_data(partner_onboarding_history=history, partner_profile=profile)
 
     if not profile.get("ready"):
@@ -465,6 +490,10 @@ async def _partner_onboarding_message(message: types.Message, state: FSMContext)
         essential = all(profile.get(k) for k in ("business_name", "city", "direction")) and bool(profile.get("services"))
         if not essential:
             question = missing_question(profile, lang)
+            next_field = (profile.get("missing") or [None])[0]
+            await state.update_data(partner_onboarding_pending_field=next_field)
+            history.append({"role": "assistant", "content": question})
+            await state.update_data(partner_onboarding_history=history)
             await message.answer(
                 t(lang,
                   f"🤖 Ես արդեն հավաքել եմ ձեր ասած տվյալները։ {question}",

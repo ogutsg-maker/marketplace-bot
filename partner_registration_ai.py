@@ -69,7 +69,7 @@ def _heuristic(text: str) -> dict:
             "missing": ["business_name", "city", "services"]}
 
 
-async def extract(text: str, history: list[dict], db) -> dict:
+async def extract(text: str, history: list[dict], db, previous_profile: dict | None = None, pending_field: str | None = None) -> dict:
     catalog = _catalog(db)
     api_key = os.getenv("GROQ_API_KEY", "").strip()
     if not api_key or AsyncGroq is None:
@@ -77,9 +77,14 @@ async def extract(text: str, history: list[dict], db) -> dict:
 
     client = AsyncGroq(api_key=api_key)
     catalog_text = json.dumps(catalog[:250], ensure_ascii=False)
+    previous_profile = previous_profile or {}
+    pending_instruction = (
+        f"The previous assistant asked specifically for {pending_field}. Treat the new message as the answer to that field unless the message clearly contains broader business information."
+        if pending_field else ""
+    )
     messages = [
-        {"role": "system", "content": """You are the partner-onboarding AI for Armenia AI Guide.\nExtract a business profile from natural Armenian, Russian or English. Do not invent facts. Merge the new message with the conversation history. Determine the best existing master direction and subcategories from the supplied catalog. Extract every service and price explicitly mentioned. A price can be a number in AMD; preserve 'from' semantics in description if present.\nReturn ONLY valid JSON with this schema:\n{\"business_name\":null,\"city\":null,\"district\":null,\"direction\":null,\"subcategory_names\":[],\"description\":\"\",\"services\":[{\"name\":\"\",\"price\":null,\"price_type\":\"fixed|from|range|unknown\"}],\"missing\":[],\"ready\":false}\nready=true only when business_name, city, direction and at least one service are known. missing should contain only the still-required fields. Ask for the smallest missing piece next."""},
-        {"role": "user", "content": "CATALOG:\n" + catalog_text + "\n\nCONVERSATION:\n" + json.dumps(history[-8:], ensure_ascii=False) + "\n\nNEW MESSAGE:\n" + text},
+        {"role": "system", "content": """You are the partner-onboarding AI for Armenia AI Guide.\nExtract a business profile from natural Armenian, Russian or English. Do not invent facts. Merge the new message with the conversation history. Determine the best existing master direction and subcategories from the supplied catalog. Extract every service and price explicitly mentioned. A price can be a number in AMD; preserve 'from' semantics in description if present.\nReturn ONLY valid JSON with this schema:\n{\"business_name\":null,\"city\":null,\"district\":null,\"direction\":null,\"subcategory_names\":[],\"description\":\"\",\"services\":[{\"name\":\"\",\"price\":null,\"price_type\":\"fixed|from|range|unknown\"}],\"missing\":[],\"ready\":false}\nready=true only when business_name, city, direction and at least one service are known. missing should contain only the still-required fields. Ask for the smallest missing piece next. Preserve previously extracted fields even when the new message contains only a short answer. """},
+        {"role": "user", "content": "CATALOG:\n" + catalog_text + "\n\nPREVIOUS PROFILE:\n" + json.dumps(previous_profile, ensure_ascii=False) + "\n\nPENDING FIELD:\n" + pending_instruction + "\n\nCONVERSATION:\n" + json.dumps(history[-8:], ensure_ascii=False) + "\n\nNEW MESSAGE:\n" + text},
     ]
     try:
         r = await client.chat.completions.create(
@@ -92,9 +97,21 @@ async def extract(text: str, history: list[dict], db) -> dict:
         data = json.loads(r.choices[0].message.content or "{}")
         if not isinstance(data, dict):
             raise ValueError("AI returned non-object")
+        # Deterministically honor the field we explicitly asked for. This prevents
+        # short answers such as "Beauty Studio" from triggering the same question again.
+        if pending_field in {"business_name", "city", "district", "direction"} and text:
+            if not data.get(pending_field):
+                data[pending_field] = _norm(text)
+        if pending_field == "services" and text and not data.get("services"):
+            data["services"] = [{"name": _norm(text), "price": None, "price_type": "unknown"}]
         return data
     except Exception:
-        return _heuristic(text)
+        fallback = _heuristic(text)
+        if pending_field in {"business_name", "city", "district", "direction"}:
+            fallback[pending_field] = _norm(text)
+        elif pending_field == "services":
+            fallback["services"] = [{"name": _norm(text), "price": None, "price_type": "unknown"}]
+        return fallback
 
 
 def match_subcategories(db, names: list[str]) -> list[int]:
