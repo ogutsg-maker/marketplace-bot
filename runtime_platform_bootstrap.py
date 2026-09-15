@@ -4,6 +4,7 @@ import base64, hashlib, hmac, importlib, json, logging, os, time
 from functools import wraps
 import aiohttp, psycopg
 from aiohttp import web
+from telegram_webapp_auth import TelegramWebAppAuthError, validate_telegram_webapp_init_data
 _original_application_init = web.Application.__init__
 
 def _database_url():
@@ -90,7 +91,41 @@ async def _admin_document_viewer(request):
         logging.exception("Verification document viewer failed")
         return web.Response(text=f"Не удалось открыть документ: {str(exc)[:500]}",status=502,content_type="text/plain")
 
-async def _legacy_document_open(request):
+
+def _admin_configured_id():
+    raw=os.getenv("ADMIN_TELEGRAM_ID","").strip() or os.getenv("ADMIN_ID","").strip()
+    try: return int(raw)
+    except (TypeError,ValueError): return 0
+
+
+def _validate_admin_request(request):
+    raw=request.headers.get("X-Telegram-Init-Data","").strip()
+    if not raw:
+        raise web.HTTPUnauthorized(text='{"ok":false,"error":"telegram_init_data_required"}',content_type="application/json")
+    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip() or os.getenv("BOT_TOKEN","").strip()
+    try:
+        user=validate_telegram_webapp_init_data(raw,token)
+        uid=int(user["id"])
+    except (TelegramWebAppAuthError,KeyError,TypeError,ValueError) as exc:
+        raise web.HTTPUnauthorized(text=json.dumps({"ok":False,"error":str(exc) or "invalid_telegram_init_data"}),content_type="application/json")
+    admin_id=_admin_configured_id()
+    if not admin_id or uid!=admin_id:
+        raise web.HTTPForbidden(text='{"ok":false,"error":"admin_access_required"}',content_type="application/json")
+    request["admin_telegram_id"]=uid
+    return uid
+
+@web.middleware
+async def _admin_auth_middleware(request,handler):
+    if request.path.startswith("/api/admin/"):
+        _validate_admin_request(request)
+    return await handler(request)
+
+async def _admin_auth_probe(request):
+    uid=_validate_admin_request(request)
+    return web.json_response({"ok":True,"telegram_id":uid})
+
+
+def _legacy_document_open(request):
     from stage3_partner_verification import _admin_telegram_id
     admin_id=_admin_telegram_id(request,request.app.get("stage3_bot_token"),request.app.get("stage3_admin_id"))
     pid,doc_id=int(request.match_info["id"]),int(request.match_info["doc_id"])
@@ -120,6 +155,10 @@ def _bootstrap(app):
     from client_api import register_client_routes; register_client_routes(app,ai)
     from admin_ai_api import register_admin_ai_routes; register_admin_ai_routes(app,ai,bot=bot)
     from marketplace_flow_api import register_marketplace_flow_routes; register_marketplace_flow_routes(app)
+    if not getattr(app,"_armenia_admin_auth_registered",False):
+        app.middlewares.append(_admin_auth_middleware)
+        app.router.add_get("/api/admin/auth",_admin_auth_probe)
+        app._armenia_admin_auth_registered=True
     if not getattr(app,"_armenia_document_proxy_registered",False):
         app.router.add_get("/api/admin/partner-applications/{id}/documents/{doc_id}/proxy",_admin_document_proxy)
         app.router.add_get("/api/admin/partner-applications/{id}/documents/{doc_id}/viewer",_admin_document_viewer)
