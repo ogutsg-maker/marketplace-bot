@@ -1824,6 +1824,7 @@ async def main():
     app.router.add_delete("/api/admin/subcategory/{id}", api_admin_subcategory_delete)
 
     # Compatibility document-open routes (for older Stage-3 deployments).
+    app.router.add_get("/api/admin/partner-applications/{id}/documents/{doc_id}/url", api_admin_partner_document_open)
     app.router.add_get("/api/admin/partner-applications/{id}/documents/{doc_id}/open", api_admin_partner_document_open)
     app.router.add_get("/api/admin/partner-applications/{id}/documents/{doc_id}/open-file", api_admin_partner_document_open_file)
 
