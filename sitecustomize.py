@@ -35,9 +35,9 @@ def _run_compat_migrations():
 
 _run_compat_migrations()
 
-# Install the administrator-only Telegram WebApp button after main.py has
-# registered its /start handler. Normal users are never given this button.
+# Configure the administrator's Telegram menu button after the bot is created.
+# This is deliberately independent from aiogram handler monkey-patching.
 try:
-    import admin_button_bootstrap  # noqa: F401,E402
+    import admin_access  # noqa: F401,E402
 except Exception as exc:
-    print(f"[sitecustomize] admin button bootstrap skipped: {exc!r}", flush=True)
+    print(f"[sitecustomize] admin access bootstrap skipped: {exc!r}", flush=True)
