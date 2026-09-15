@@ -1,9 +1,14 @@
 """Runtime compatibility/bootstrap layer for Armenia AI Guide."""
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import importlib
+import json
 import logging
 import os
+import time
 from functools import wraps
 
 import aiohttp
@@ -13,8 +18,9 @@ from aiohttp import web
 _original_application_init = web.Application.__init__
 
 
-def _document_download_url(pid: int, doc_id: int) -> str:
-    return f"/api/admin/partner-applications/{pid}/documents/{doc_id}/proxy"
+def _document_download_url(pid: int, doc_id: int, token: str | None = None) -> str:
+    url = f"/api/admin/partner-applications/{pid}/documents/{doc_id}/proxy"
+    return f"{url}?access={token}" if token else url
 
 
 def _database_url() -> str:
@@ -40,7 +46,6 @@ def _storage_config():
 
 
 def _db_fetchone(sql, params=()):
-    # PgBouncer/Supabase transaction pooling: disable automatic prepared statements.
     with psycopg.connect(_database_url(), prepare_threshold=None) as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
@@ -49,6 +54,52 @@ def _db_fetchone(sql, params=()):
                 return None
             cols = [d.name for d in cur.description]
             return dict(zip(cols, row))
+
+
+def _document_access_secret() -> bytes:
+    return (
+        os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        or os.getenv("BOT_TOKEN", "").strip()
+        or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    ).encode()
+
+
+def _make_document_access_token(pid: int, doc_id: int, ttl: int = 300) -> str:
+    """Create a short-lived, signed token for opening a document in a new tab.
+
+    The admin WebApp cannot attach X-Telegram-Init-Data to window.open().
+    This token is only an alternative for the already-authenticated admin's
+    document-open endpoint and expires quickly.
+    """
+    payload = {
+        "pid": int(pid),
+        "doc": int(doc_id),
+        "exp": int(time.time()) + int(ttl),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    body = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    sig = hmac.new(_document_access_secret(), body.encode(), hashlib.sha256).digest()
+    signature = base64.urlsafe_b64encode(sig).decode().rstrip("=")
+    return f"{body}.{signature}"
+
+
+def _verify_document_access_token(token: str, pid: int, doc_id: int) -> bool:
+    try:
+        body, supplied = token.split(".", 1)
+        expected = base64.urlsafe_b64encode(
+            hmac.new(_document_access_secret(), body.encode(), hashlib.sha256).digest()
+        ).decode().rstrip("=")
+        if not hmac.compare_digest(supplied, expected):
+            return False
+        raw = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        payload = json.loads(raw.decode())
+        return (
+            int(payload.get("pid")) == int(pid)
+            and int(payload.get("doc")) == int(doc_id)
+            and int(payload.get("exp", 0)) >= int(time.time())
+        )
+    except Exception:
+        return False
 
 
 async def _storage_direct_download(path: str) -> bytes:
@@ -82,23 +133,29 @@ async def _storage_signed_download(path: str) -> bytes:
 
 
 async def _admin_document_proxy(request: web.Request):
-    """Authenticated same-origin document endpoint used by the admin WebApp.
-
-    It deliberately returns the actual file bytes instead of exposing a private
-    Supabase URL to the browser. Storage download has a signed-URL path and a
-    direct service-role fallback, so old uploads remain readable even when the
-    Storage signing endpoint is unavailable.
-    """
+    """Authenticated same-origin document endpoint used by the admin WebApp."""
     from stage3_partner_verification import _admin_telegram_id
-
-    _admin_telegram_id(
-        request,
-        request.app.get("stage3_bot_token"),
-        request.app.get("stage3_admin_id"),
-    )
 
     pid = int(request.match_info["id"])
     doc_id = int(request.match_info["doc_id"])
+
+    # Normal WebApp fetch: authenticate with Telegram init data.
+    init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
+    if init_data:
+        _admin_telegram_id(
+            request,
+            request.app.get("stage3_bot_token"),
+            request.app.get("stage3_admin_id"),
+        )
+    else:
+        # New-tab/window.open fallback: the browser cannot add a custom auth header.
+        access = request.query.get("access", "").strip()
+        if not access or not _verify_document_access_token(access, pid, doc_id):
+            raise web.HTTPUnauthorized(
+                text='{"ok":false,"error":"document_access_required"}',
+                content_type="application/json",
+            )
+
     row = _db_fetchone(
         "SELECT original_filename,mime_type,storage_path,file_data "
         "FROM partner_verification_documents WHERE id=%s AND partner_id=%s",
@@ -145,11 +202,7 @@ async def _admin_document_proxy(request: web.Request):
             doc_id,
         )
         return web.json_response(
-            {
-                "ok": False,
-                "error": "document_open_failed",
-                "details": str(exc)[:500],
-            },
+            {"ok": False, "error": "document_open_failed", "details": str(exc)[:500]},
             status=502,
         )
 
@@ -172,11 +225,13 @@ async def _legacy_document_open(request: web.Request):
     )
     if not row:
         return web.json_response({"ok": False, "error": "document_not_found"}, status=404)
+
+    token = _make_document_access_token(pid, doc_id)
     return web.json_response(
         {
             "ok": True,
             "admin_id": admin_id,
-            "url": _document_download_url(pid, doc_id),
+            "url": _document_download_url(pid, doc_id, token),
             "source": "database",
         }
     )
@@ -213,7 +268,6 @@ def _bootstrap(app: web.Application) -> None:
         db.set_master_categories = bridged_set_master_categories
         db._armenia_direction_bridge = True
 
-    # Compatibility handlers are assigned before main.py registers its routes.
     main.api_admin_partner_document_open = _legacy_document_open
     main.api_admin_partner_document_open_file = _admin_document_proxy
 
