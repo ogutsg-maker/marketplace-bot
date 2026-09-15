@@ -11,6 +11,12 @@ IMPORTANT:
 - existing rows are NOT deleted;
 - existing columns are NOT recreated;
 - missing columns are added only when necessary.
+
+Supabase/managed PostgreSQL can use PgBouncer transaction pooling. Psycopg's
+automatic prepared statements are unsafe with that setup because a prepared
+statement can exist on one backend connection while the next statement is
+routed to another backend. The schema migration therefore explicitly disables
+automatic prepared statements for this connection.
 """
 
 from __future__ import annotations
@@ -24,6 +30,13 @@ def _db_url() -> str:
     if not url:
         raise RuntimeError("DATABASE_URL is not configured")
     return url
+
+
+def _connect():
+    # IMPORTANT: do not let psycopg create named prepared statements here.
+    # Render/Supabase may route DATABASE_URL through PgBouncer transaction
+    # pooling, where prepared statements can collide (DuplicatePreparedStatement).
+    return psycopg.connect(_db_url(), prepare_threshold=None)
 
 
 def _column_exists(cur, table: str, column: str) -> bool:
@@ -49,7 +62,6 @@ def _add_column(cur, table: str, column: str, definition: str) -> None:
 
 
 def _ensure_bookings_table(cur) -> None:
-    # New installation.
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS bookings (
@@ -75,10 +87,6 @@ def _ensure_bookings_table(cur) -> None:
         """
     )
 
-    # Existing production table.
-    #
-    # CREATE TABLE IF NOT EXISTS does NOT add these columns to an existing
-    # table. Add only missing columns.
     columns = {
         "request_id": "BIGINT",
         "negotiation_id": "BIGINT",
@@ -102,7 +110,6 @@ def _ensure_bookings_table(cur) -> None:
     for column, definition in columns.items():
         _add_column(cur, "bookings", column, definition)
 
-    # Make newly introduced business fields safe for old rows.
     cur.execute(
         """
         UPDATE bookings
@@ -120,14 +127,12 @@ def _ensure_bookings_table(cur) -> None:
         """
     )
 
-    # The indexes are created only AFTER the columns are guaranteed to exist.
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_bookings_partner_status
         ON bookings(partner_id, status, updated_at DESC)
         """
     )
-
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_bookings_client_status
@@ -171,23 +176,11 @@ def _ensure_payments(cur) -> None:
         "created_at": "TIMESTAMPTZ DEFAULT NOW()",
         "updated_at": "TIMESTAMPTZ DEFAULT NOW()",
     }
-
     for column, definition in columns.items():
         _add_column(cur, "payments", column, definition)
 
-    cur.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_payments_booking
-        ON payments(booking_id)
-        """
-    )
-
-    cur.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_payments_partner
-        ON payments(partner_id, status)
-        """
-    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_booking ON payments(booking_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_payments_partner ON payments(partner_id, status)")
 
 
 def _ensure_checkins(cur) -> None:
@@ -205,7 +198,6 @@ def _ensure_checkins(cur) -> None:
         )
         """
     )
-
     columns = {
         "booking_id": "BIGINT",
         "token": "TEXT",
@@ -215,16 +207,9 @@ def _ensure_checkins(cur) -> None:
         "checked_in_by": "BIGINT",
         "data_json": "JSONB DEFAULT '{}'::jsonb",
     }
-
     for column, definition in columns.items():
         _add_column(cur, "booking_checkins", column, definition)
-
-    cur.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_booking_checkins_booking
-        ON booking_checkins(booking_id)
-        """
-    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_booking_checkins_booking ON booking_checkins(booking_id)")
 
 
 def _ensure_cancellations(cur) -> None:
@@ -240,7 +225,6 @@ def _ensure_cancellations(cur) -> None:
         )
         """
     )
-
     columns = {
         "booking_id": "BIGINT",
         "cancelled_by": "TEXT DEFAULT 'system'",
@@ -248,16 +232,9 @@ def _ensure_cancellations(cur) -> None:
         "refund_amount": "NUMERIC DEFAULT 0",
         "created_at": "TIMESTAMPTZ DEFAULT NOW()",
     }
-
     for column, definition in columns.items():
         _add_column(cur, "booking_cancellations", column, definition)
-
-    cur.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_booking_cancellations_booking
-        ON booking_cancellations(booking_id, created_at DESC)
-        """
-    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_booking_cancellations_booking ON booking_cancellations(booking_id, created_at DESC)")
 
 
 def _ensure_financial_ledger(cur) -> None:
@@ -275,7 +252,6 @@ def _ensure_financial_ledger(cur) -> None:
         )
         """
     )
-
     columns = {
         "partner_id": "BIGINT",
         "booking_id": "BIGINT",
@@ -285,16 +261,9 @@ def _ensure_financial_ledger(cur) -> None:
         "description": "TEXT DEFAULT ''",
         "created_at": "TIMESTAMPTZ DEFAULT NOW()",
     }
-
     for column, definition in columns.items():
         _add_column(cur, "partner_financial_ledger", column, definition)
-
-    cur.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_partner_financial_ledger
-        ON partner_financial_ledger(partner_id, created_at DESC)
-        """
-    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_partner_financial_ledger ON partner_financial_ledger(partner_id, created_at DESC)")
 
 
 def _ensure_contact_disclosures(cur) -> None:
@@ -314,7 +283,6 @@ def _ensure_contact_disclosures(cur) -> None:
         )
         """
     )
-
     columns = {
         "client_id": "BIGINT",
         "partner_id": "BIGINT",
@@ -326,22 +294,14 @@ def _ensure_contact_disclosures(cur) -> None:
         "created_at": "TIMESTAMPTZ DEFAULT NOW()",
         "updated_at": "TIMESTAMPTZ DEFAULT NOW()",
     }
-
     for column, definition in columns.items():
         _add_column(cur, "contact_disclosures", column, definition)
-
-    cur.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_contact_disclosures_client
-        ON contact_disclosures(client_id, created_at DESC)
-        """
-    )
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_contact_disclosures_client ON contact_disclosures(client_id, created_at DESC)")
 
 
 def ensure_booking_schema() -> None:
     """Create and safely upgrade booking-related PostgreSQL tables."""
-
-    with psycopg.connect(_db_url()) as conn:
+    with _connect() as conn:
         with conn.cursor() as cur:
             _ensure_bookings_table(cur)
             _ensure_payments(cur)
@@ -349,5 +309,4 @@ def ensure_booking_schema() -> None:
             _ensure_cancellations(cur)
             _ensure_financial_ledger(cur)
             _ensure_contact_disclosures(cur)
-
         conn.commit()
