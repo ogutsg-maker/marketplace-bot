@@ -12,8 +12,7 @@
 <script>
 (async()=>{
   try{
-    const url='/admin.html?fresh='+Date.now();
-    const r=await fetch(url,{cache:'no-store',headers:{'Cache-Control':'no-cache'}});
+    const r=await fetch('/admin_app.html?fresh='+Date.now(),{cache:'no-store',headers:{'Cache-Control':'no-cache'}});
     if(!r.ok)throw new Error('HTTP '+r.status);
     const html=await r.text();
     document.open();
