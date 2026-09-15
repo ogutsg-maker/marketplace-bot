@@ -136,22 +136,22 @@ async def _admin_document_proxy(request: web.Request):
 
 
 async def _admin_document_viewer(request: web.Request):
-    """Mobile-safe viewer. Telegram WebView cannot reliably display a raw PDF/image opened from window.open()."""
-    from stage3_partner_verification import _admin_telegram_id
+    """Mobile-safe viewer; authentication is carried by the short-lived access token."""
     pid, doc_id = int(request.match_info["id"]), int(request.match_info["doc_id"])
-    admin_id = _admin_telegram_id(request, request.app.get("stage3_bot_token"), request.app.get("stage3_admin_id"))
+    token = request.query.get("access", "").strip()
+    if not _verify_document_access_token(token, pid, doc_id):
+        raise web.HTTPUnauthorized(text='{"ok":false,"error":"document_access_required"}', content_type="application/json")
     row = await _get_document(pid, doc_id)
     if not row:
         return web.Response(text="Документ не найден", status=404, content_type="text/plain")
-    token = _make_document_access_token(pid, doc_id)
     proxy = _document_download_url(pid, doc_id, token)
     filename = str(row.get("original_filename") or "document").replace('"', "&quot;")
     mime = str(row.get("mime_type") or "application/octet-stream")
     title = "Документ партнёра"
     if mime == "application/pdf":
-        body = f'''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>html,body{{margin:0;height:100%;background:#111827;color:#fff;font:16px system-ui}}header{{height:52px;display:flex;align-items:center;padding:0 12px;box-sizing:border-box;gap:10px}}iframe{{display:block;width:100%;height:calc(100% - 52px);border:0;background:#fff}}a{{color:#fff;background:#2563eb;padding:8px 12px;border-radius:8px;text-decoration:none}}</style><header><b>{filename}</b><a href="{proxy}" download>Скачать</a></header><iframe src="{proxy}"></iframe>'''
+        body = f'''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>html,body{{margin:0;height:100%;background:#111827;color:#fff;font:16px system-ui}}header{{height:52px;display:flex;align-items:center;padding:0 12px;box-sizing:border-box;gap:10px;overflow:hidden}}header b{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}}iframe{{display:block;width:100%;height:calc(100% - 52px);border:0;background:#fff}}a{{color:#fff;background:#2563eb;padding:8px 12px;border-radius:8px;text-decoration:none;white-space:nowrap}}</style><header><b>{filename}</b><a href="{proxy}" download>Скачать</a></header><iframe src="{proxy}"></iframe>'''
     elif mime.startswith("image/"):
-        body = f'''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>html,body{{margin:0;min-height:100%;background:#111827;color:#fff;font:16px system-ui}}header{{padding:12px;display:flex;justify-content:space-between;gap:10px}}main{{display:flex;justify-content:center;align-items:center;padding:10px;min-height:calc(100vh - 70px);box-sizing:border-box}}img{{max-width:100%;max-height:calc(100vh - 90px);object-fit:contain}}a{{color:#fff;background:#2563eb;padding:8px 12px;border-radius:8px;text-decoration:none}}</style><header><b>{filename}</b><a href="{proxy}" download>Скачать</a></header><main><img src="{proxy}" alt="Документ"></main>'''
+        body = f'''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>html,body{{margin:0;min-height:100%;background:#111827;color:#fff;font:16px system-ui}}header{{padding:12px;display:flex;justify-content:space-between;gap:10px}}main{{display:flex;justify-content:center;align-items:center;padding:10px;min-height:calc(100vh - 70px);box-sizing:border-box}}img{{max-width:100%;max-height:calc(100vh - 90px);object-fit:contain}}a{{color:#fff;background:#2563eb;padding:8px 12px;border-radius:8px;text-decoration:none;white-space:nowrap}}</style><header><b>{filename}</b><a href="{proxy}" download>Скачать</a></header><main><img src="{proxy}" alt="Документ"></main>'''
     else:
         body = f'''<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><p style="font:16px system-ui;padding:20px">{filename}</p><p style="padding:20px"><a href="{proxy}" download>Скачать документ</a></p>'''
     return web.Response(text=body, content_type="text/html", headers={"Cache-Control": "private, no-store"})
@@ -164,7 +164,8 @@ async def _legacy_document_open(request: web.Request):
     if not _db_fetchone("SELECT id FROM partner_verification_documents WHERE id=%s AND partner_id=%s", (doc_id, pid)):
         return web.json_response({"ok": False, "error": "document_not_found"}, status=404)
     token = _make_document_access_token(pid, doc_id)
-    return web.json_response({"ok": True, "admin_id": admin_id, "url": _document_download_url(pid, doc_id, token), "viewer_url": f"/api/admin/partner-applications/{pid}/documents/{doc_id}/viewer?access={token}", "source": "database"})
+    viewer = f"/api/admin/partner-applications/{pid}/documents/{doc_id}/viewer?access={token}"
+    return web.json_response({"ok": True, "admin_id": admin_id, "url": viewer, "viewer_url": viewer, "source": "database"})
 
 
 def _bootstrap(app: web.Application) -> None:
