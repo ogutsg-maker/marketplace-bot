@@ -12,6 +12,12 @@ def db_url() -> str:
     return value
 
 
+def _connect():
+    # Render/Supabase may use PgBouncer transaction pooling. Disable Psycopg
+    # automatic prepared statements for schema/bootstrap work.
+    return psycopg.connect(db_url(), prepare_threshold=None)
+
+
 def ensure_platform_schema() -> None:
     """Create only new architecture tables; never delete legacy marketplace data."""
     sql = r'''
@@ -38,220 +44,90 @@ def ensure_platform_schema() -> None:
         id BIGSERIAL PRIMARY KEY,
         partner_id BIGINT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
         country TEXT NOT NULL DEFAULT 'Armenia',
-        marz TEXT,
-        city TEXT,
-        village TEXT,
-        address TEXT,
-        location_type TEXT NOT NULL DEFAULT 'fixed'
-            CHECK (location_type IN ('fixed','mobile','online','outbound')),
-        data_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        marz TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+        village TEXT NOT NULL DEFAULT '', address TEXT NOT NULL DEFAULT '',
+        location_type TEXT NOT NULL DEFAULT 'city', data_json JSONB NOT NULL DEFAULT '{}'::jsonb
     );
 
     CREATE TABLE IF NOT EXISTS catalog_subcategories (
         id BIGSERIAL PRIMARY KEY,
-        category_id INT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
-        name_am TEXT NOT NULL,
-        name_ru TEXT NOT NULL,
-        name_en TEXT NOT NULL DEFAULT '',
-        slug TEXT NOT NULL UNIQUE,
-        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE(category_id, name_ru)
+        category_id BIGINT NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+        name_am TEXT NOT NULL DEFAULT '', name_ru TEXT NOT NULL DEFAULT '',
+        name_en TEXT NOT NULL DEFAULT '', slug TEXT NOT NULL DEFAULT '',
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        data_json JSONB NOT NULL DEFAULT '{}'::jsonb
     );
 
     CREATE TABLE IF NOT EXISTS partner_objects (
         id BIGSERIAL PRIMARY KEY,
         partner_id BIGINT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-        object_name TEXT NOT NULL,
-        address TEXT,
-        city TEXT,
-        marz TEXT,
-        data_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        name TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+        location_id BIGINT REFERENCES partner_locations(id) ON DELETE SET NULL,
+        status TEXT NOT NULL DEFAULT 'draft', data_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS partner_services (
         id BIGSERIAL PRIMARY KEY,
         partner_id BIGINT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-        category_id INT REFERENCES categories(id) ON DELETE SET NULL,
-        object_id BIGINT REFERENCES partner_objects(id) ON DELETE SET NULL,
-        service_name TEXT NOT NULL,
-        description TEXT NOT NULL DEFAULT '',
-        base_price NUMERIC,
-        min_price NUMERIC,
-        max_price NUMERIC,
-        duration_minutes INT,
-        price_type TEXT NOT NULL DEFAULT 'fixed',
-        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        service_id BIGINT, object_id BIGINT REFERENCES partner_objects(id) ON DELETE SET NULL,
+        status TEXT NOT NULL DEFAULT 'draft', data_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS services (
         id BIGSERIAL PRIMARY KEY,
         partner_id BIGINT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-        category_id INT REFERENCES categories(id) ON DELETE SET NULL,
+        category_id BIGINT REFERENCES categories(id) ON DELETE SET NULL,
         subcategory_id BIGINT REFERENCES catalog_subcategories(id) ON DELETE SET NULL,
-        name TEXT NOT NULL,
-        description TEXT NOT NULL DEFAULT '',
-        price NUMERIC,
-        currency TEXT NOT NULL DEFAULT 'AMD',
-        duration_minutes INT,
+        name TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+        price NUMERIC, currency TEXT NOT NULL DEFAULT 'AMD', duration_minutes INTEGER,
         status TEXT NOT NULL DEFAULT 'draft'
             CHECK (status IN ('draft','pending','approved','rejected','frozen','deleted')),
         data_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS service_packages (
         id BIGSERIAL PRIMARY KEY,
         service_id BIGINT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
-        name TEXT NOT NULL,
-        price NUMERIC NOT NULL DEFAULT 0,
-        currency TEXT NOT NULL DEFAULT 'AMD',
-        description TEXT NOT NULL DEFAULT '',
-        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        name TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+        price NUMERIC DEFAULT 0, currency TEXT NOT NULL DEFAULT 'AMD',
+        data_json JSONB NOT NULL DEFAULT '{}'::jsonb
     );
 
     CREATE TABLE IF NOT EXISTS service_options (
         id BIGSERIAL PRIMARY KEY,
         service_id BIGINT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
-        name TEXT NOT NULL,
-        price_delta NUMERIC NOT NULL DEFAULT 0,
-        currency TEXT NOT NULL DEFAULT 'AMD',
-        is_active BOOLEAN NOT NULL DEFAULT TRUE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        name TEXT NOT NULL DEFAULT '', price_delta NUMERIC DEFAULT 0,
+        data_json JSONB NOT NULL DEFAULT '{}'::jsonb
     );
 
     CREATE TABLE IF NOT EXISTS service_schedule (
         id BIGSERIAL PRIMARY KEY,
         service_id BIGINT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
-        weekday INT NOT NULL CHECK (weekday BETWEEN 0 AND 6),
-        start_time TIME,
-        end_time TIME,
-        is_available BOOLEAN NOT NULL DEFAULT TRUE,
-        UNIQUE(service_id, weekday)
+        weekday INTEGER, start_time TIME, end_time TIME, data_json JSONB NOT NULL DEFAULT '{}'::jsonb
     );
-
-    CREATE TABLE IF NOT EXISTS ai_sessions (
-        id BIGSERIAL PRIMARY KEY,
-        user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
-        role TEXT NOT NULL CHECK (role IN ('client','partner','admin')),
-        session_type TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'active',
-        context_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_ai_active_session
-        ON ai_sessions(user_id, role, session_type) WHERE status='active';
-
-    CREATE TABLE IF NOT EXISTS ai_messages (
-        id BIGSERIAL PRIMARY KEY,
-        session_id BIGINT NOT NULL REFERENCES ai_sessions(id) ON DELETE CASCADE,
-        sender_role TEXT NOT NULL CHECK (sender_role IN ('user','ai','admin','system')),
-        message_text TEXT NOT NULL,
-        data_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_ai_messages_session ON ai_messages(session_id, created_at);
-
-    CREATE TABLE IF NOT EXISTS ai_catalog_proposals (
-        id BIGSERIAL PRIMARY KEY,
-        source TEXT NOT NULL DEFAULT 'partner_ai',
-        partner_id BIGINT REFERENCES partners(id) ON DELETE SET NULL,
-        direction_id BIGINT,
-        proposed_master_category TEXT,
-        proposed_category TEXT,
-        proposed_subcategory TEXT,
-        proposed_service TEXT,
-        description TEXT NOT NULL DEFAULT '',
-        reason TEXT NOT NULL DEFAULT '',
-        payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-        status TEXT NOT NULL DEFAULT 'pending'
-            CHECK (status IN ('pending','edited','clarification','approved','rejected','merged')),
-        admin_comment TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        reviewed_at TIMESTAMPTZ,
-        reviewed_by BIGINT
-    );
-    CREATE INDEX IF NOT EXISTS idx_ai_catalog_proposals_status ON ai_catalog_proposals(status, created_at DESC);
 
     CREATE TABLE IF NOT EXISTS potential_partners (
         id BIGSERIAL PRIMARY KEY,
-        source TEXT NOT NULL DEFAULT 'ai_research',
-        business_name TEXT NOT NULL,
-        description TEXT NOT NULL DEFAULT '',
-        direction TEXT,
-        category TEXT,
-        subcategory TEXT,
-        country TEXT DEFAULT 'Armenia',
-        marz TEXT,
-        city TEXT,
-        village TEXT,
-        phone TEXT,
-        website TEXT,
-        email TEXT,
-        social_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-        services_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-        prices_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-        source_urls_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-        ai_reason TEXT NOT NULL DEFAULT '',
-        ai_confidence NUMERIC,
-        status TEXT NOT NULL DEFAULT 'new'
-            CHECK (status IN ('new','researched','ready_for_review','contacted','interested','invited','registered','approved','active','rejected','archived')),
-        partner_id BIGINT REFERENCES partners(id) ON DELETE SET NULL,
-        admin_comment TEXT,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_potential_partners_status ON potential_partners(status, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_potential_partners_location ON potential_partners(marz, city, village);
-
-    CREATE TABLE IF NOT EXISTS potential_partner_sources (
-        id BIGSERIAL PRIMARY KEY,
-        potential_partner_id BIGINT NOT NULL REFERENCES potential_partners(id) ON DELETE CASCADE,
-        source_type TEXT NOT NULL,
-        url TEXT,
-        title TEXT,
-        raw_text TEXT,
-        captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS admin_clarifications (
-        id BIGSERIAL PRIMARY KEY,
-        proposal_id BIGINT REFERENCES ai_catalog_proposals(id) ON DELETE CASCADE,
-        partner_id BIGINT REFERENCES partners(id) ON DELETE CASCADE,
-        admin_id BIGINT,
-        message TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'sent' CHECK (status IN ('sent','answered','closed')),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        answered_at TIMESTAMPTZ
-    );
-
-    CREATE TABLE IF NOT EXISTS client_profiles (
-        user_id BIGINT PRIMARY KEY REFERENCES users(telegram_id) ON DELETE CASCADE,
-        preferences_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        category_id BIGINT REFERENCES categories(id) ON DELETE SET NULL,
+        subcategory_id BIGINT REFERENCES catalog_subcategories(id) ON DELETE SET NULL,
+        business_name TEXT NOT NULL DEFAULT '', city TEXT NOT NULL DEFAULT '',
+        source_url TEXT NOT NULL DEFAULT '', source_name TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'new', data_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS service_requests (
         id BIGSERIAL PRIMARY KEY,
-        client_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
-        category_id INT REFERENCES categories(id) ON DELETE SET NULL,
+        client_id BIGINT NOT NULL,
+        category_id BIGINT REFERENCES categories(id) ON DELETE SET NULL,
         subcategory_id BIGINT REFERENCES catalog_subcategories(id) ON DELETE SET NULL,
-        status TEXT NOT NULL DEFAULT 'discovery'
-            CHECK (status IN ('discovery','searching','options_found','selected','waiting_partner','negotiating','confirmed','payment','booked','completed','cancelled','dispute')),
-        language TEXT DEFAULT 'hy',
-        city TEXT,
-        summary TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'discovery', language TEXT NOT NULL DEFAULT 'hy',
+        city TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
         preferences_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS request_candidates (
@@ -259,41 +135,35 @@ def ensure_platform_schema() -> None:
         request_id BIGINT NOT NULL REFERENCES service_requests(id) ON DELETE CASCADE,
         partner_id BIGINT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
         service_id BIGINT REFERENCES services(id) ON DELETE SET NULL,
-        rank_score NUMERIC,
-        match_reason TEXT NOT NULL DEFAULT '',
-        status TEXT NOT NULL DEFAULT 'suggested',
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE(request_id, partner_id, service_id)
+        rank_score NUMERIC DEFAULT 0, match_reason TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'suggested',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS negotiations (
         id BIGSERIAL PRIMARY KEY,
         request_id BIGINT NOT NULL REFERENCES service_requests(id) ON DELETE CASCADE,
-        client_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
-        partner_id BIGINT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-        status TEXT NOT NULL DEFAULT 'active'
-            CHECK (status IN ('active','agreed','declined','expired','cancelled')),
-        state_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        client_id BIGINT NOT NULL, partner_id BIGINT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'active', state_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS negotiation_messages (
         id BIGSERIAL PRIMARY KEY,
         negotiation_id BIGINT NOT NULL REFERENCES negotiations(id) ON DELETE CASCADE,
-        sender_role TEXT NOT NULL CHECK (sender_role IN ('client','partner','ai')),
-        sender_id BIGINT,
-        message TEXT NOT NULL,
-        data_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        sender_role TEXT NOT NULL, sender_id BIGINT, message TEXT NOT NULL DEFAULT '',
+        data_json JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE INDEX IF NOT EXISTS idx_services_partner_status ON services(partner_id, status);
-    CREATE INDEX IF NOT EXISTS idx_partner_locations_partner ON partner_locations(partner_id);
-    CREATE INDEX IF NOT EXISTS idx_service_requests_client ON service_requests(client_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_negotiations_request ON negotiations(request_id, status);
+    CREATE INDEX IF NOT EXISTS idx_services_catalog ON services(category_id, subcategory_id, status);
+    CREATE INDEX IF NOT EXISTS idx_partner_directions_lookup ON partner_directions(partner_id, status);
+    CREATE INDEX IF NOT EXISTS idx_requests_client_status ON service_requests(client_id, status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_negotiations_client ON negotiations(client_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_negotiations_partner ON negotiations(partner_id, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_negotiation_messages ON negotiation_messages(negotiation_id, created_at);
     '''
-    with psycopg.connect(db_url()) as conn:
+
+    with _connect() as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
         conn.commit()
