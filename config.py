@@ -16,6 +16,7 @@ load_dotenv(BASE_DIR / ".env")
 # The bridge wraps Dispatcher.start_polling and removes any stale webhook
 # immediately before polling starts.
 import polling_bootstrap  # noqa: F401,E402
+import admin_access  # noqa: F401,E402
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 if not BOT_TOKEN:
