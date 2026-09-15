@@ -30,6 +30,7 @@ from ai_dispatcher import AIDispatcher
 from billing import BillingManager
 from partner_registration_ai import extract as extract_partner_profile, match_subcategories, missing_question
 from telegram_webapp_auth import TelegramWebAppAuthError, validate_telegram_webapp_init_data
+import stage3_partner_verification as stage3_partner_verification
 from stage3_partner_verification import register_stage3_routes
 
 try:
@@ -177,6 +178,111 @@ async def api_webapp_partner_start(request: web.Request):
             "🏢 <b>Let’s register your business</b>\n\nTell me naturally what the business is called, where it is located, what services you offer and their prices. I will determine the direction, subcategories and services."),
         "completed": False,
     })
+
+
+
+async def api_admin_partner_document_open(request: web.Request):
+    """Reliable admin document opener.
+
+    The deployed Stage-3 module may be an older revision where the public
+    /documents/{doc_id}/url route is missing.  Keep the existing verification
+    system untouched and expose a compatibility endpoint from main.py.
+    """
+    try:
+        admin_id = stage3_partner_verification._admin_telegram_id(
+            request,
+            BOT_TOKEN,
+            ADMIN_ID,
+        )
+        pid = int(request.match_info["id"])
+        doc_id = int(request.match_info["doc_id"])
+
+        row = stage3_partner_verification._db_fetchone(
+            """
+            SELECT id, partner_id, storage_path, file_data
+            FROM partner_verification_documents
+            WHERE id=%s AND partner_id=%s
+            """,
+            (doc_id, pid),
+        )
+        if not row:
+            return web.json_response(
+                {"ok": False, "error": "document_not_found"}, status=404
+            )
+
+        if row.get("storage_path"):
+            try:
+                url = await stage3_partner_verification._storage_signed_url(
+                    row["storage_path"], 900
+                )
+                return web.json_response({
+                    "ok": True,
+                    "admin_id": admin_id,
+                    "url": url,
+                    "source": "storage",
+                    "expires_in": 900,
+                })
+            except Exception as exc:
+                logger.warning(
+                    "Document signed URL failed, trying database fallback: %s",
+                    exc,
+                )
+
+        if row.get("file_data") is not None:
+            # Return a one-time-ish same-auth API URL. The admin page will
+            # fetch it with Telegram initData and open the resulting Blob.
+            return web.json_response({
+                "ok": True,
+                "admin_id": admin_id,
+                "url": f"/api/admin/partner-applications/{pid}/documents/{doc_id}/open-file",
+                "source": "database",
+            })
+
+        return web.json_response(
+            {"ok": False, "error": "document_file_not_available"}, status=404
+        )
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Admin document open failed")
+        return web.json_response(
+            {"ok": False, "error": "document_open_failed", "details": str(exc)[:500]},
+            status=500,
+        )
+
+
+async def api_admin_partner_document_open_file(request: web.Request):
+    """Stream a database-fallback document to an authenticated admin."""
+    try:
+        stage3_partner_verification._admin_telegram_id(request, BOT_TOKEN, ADMIN_ID)
+        pid = int(request.match_info["id"])
+        doc_id = int(request.match_info["doc_id"])
+        row = stage3_partner_verification._db_fetchone(
+            """
+            SELECT original_filename, mime_type, file_data
+            FROM partner_verification_documents
+            WHERE id=%s AND partner_id=%s
+            """,
+            (doc_id, pid),
+        )
+        if not row or row.get("file_data") is None:
+            return web.json_response(
+                {"ok": False, "error": "document_file_not_available"}, status=404
+            )
+        filename = str(row.get("original_filename") or "document").replace('"', "")
+        return web.Response(
+            body=bytes(row["file_data"]),
+            content_type=row.get("mime_type") or "application/octet-stream",
+            headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        )
+    except web.HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Admin document download failed")
+        return web.json_response(
+            {"ok": False, "error": "document_download_failed", "details": str(exc)[:500]},
+            status=500,
+        )
 
 
 async def api_webapp_partner_message(request: web.Request):
@@ -1716,6 +1822,10 @@ async def main():
     app.router.add_delete("/api/admin/master_category/{id}", api_admin_master_category_delete)
     app.router.add_post("/api/admin/subcategory", api_admin_subcategory_create)
     app.router.add_delete("/api/admin/subcategory/{id}", api_admin_subcategory_delete)
+
+    # Compatibility document-open routes (for older Stage-3 deployments).
+    app.router.add_get("/api/admin/partner-applications/{id}/documents/{doc_id}/open", api_admin_partner_document_open)
+    app.router.add_get("/api/admin/partner-applications/{id}/documents/{doc_id}/open-file", api_admin_partner_document_open_file)
 
     # Stage 3 — partner verification / admin moderation.
     register_stage3_routes(
