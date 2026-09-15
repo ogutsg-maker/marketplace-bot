@@ -3,12 +3,7 @@ import os
 
 
 def _run_compat_migrations():
-    """Repair legacy PostgreSQL schemas before application routes are used.
-
-    This is intentionally additive/non-destructive. Older deployments created
-    admin_audit_log with a different column name; Stage 3 now writes the
-    canonical admin_telegram_id column. Keep both schemas compatible.
-    """
+    """Repair legacy PostgreSQL schemas before application routes are used."""
     url = os.getenv("DATABASE_URL", "").strip()
     if not url:
         return
@@ -27,35 +22,22 @@ def _run_compat_migrations():
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                     )
                 """)
-                cur.execute("""
-                    ALTER TABLE admin_audit_log
-                    ADD COLUMN IF NOT EXISTS admin_telegram_id BIGINT
-                """)
-                cur.execute("""
-                    ALTER TABLE admin_audit_log
-                    ADD COLUMN IF NOT EXISTS action TEXT
-                """)
-                cur.execute("""
-                    ALTER TABLE admin_audit_log
-                    ADD COLUMN IF NOT EXISTS entity_type TEXT
-                """)
-                cur.execute("""
-                    ALTER TABLE admin_audit_log
-                    ADD COLUMN IF NOT EXISTS entity_id BIGINT
-                """)
-                cur.execute("""
-                    ALTER TABLE admin_audit_log
-                    ADD COLUMN IF NOT EXISTS details_json JSONB DEFAULT '{}'::jsonb
-                """)
-                cur.execute("""
-                    ALTER TABLE admin_audit_log
-                    ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()
-                """)
+                cur.execute("ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS admin_telegram_id BIGINT")
+                cur.execute("ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS action TEXT")
+                cur.execute("ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS entity_type TEXT")
+                cur.execute("ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS entity_id BIGINT")
+                cur.execute("ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS details_json JSONB DEFAULT '{}'::jsonb")
+                cur.execute("ALTER TABLE admin_audit_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()")
             conn.commit()
     except Exception as exc:
-        # Never prevent the HTTP server/bot from starting because of this
-        # compatibility migration. The normal application migration can retry.
         print(f"[sitecustomize] compatibility migration skipped: {exc!r}", flush=True)
 
 
 _run_compat_migrations()
+
+# Install the administrator-only Telegram WebApp button after main.py has
+# registered its /start handler. Normal users are never given this button.
+try:
+    import admin_button_bootstrap  # noqa: F401,E402
+except Exception as exc:
+    print(f"[sitecustomize] admin button bootstrap skipped: {exc!r}", flush=True)
