@@ -94,8 +94,11 @@ async def _admin_document_viewer(request):
 
 def _admin_configured_id():
     raw=os.getenv("ADMIN_TELEGRAM_ID","").strip() or os.getenv("ADMIN_ID","").strip()
-    try: return int(raw)
-    except (TypeError,ValueError): return 0
+    if raw:
+        try: return int(raw)
+        except (TypeError,ValueError): pass
+    try: return int(getattr(importlib.import_module("__main__"),"ADMIN_ID",0) or 0)
+    except Exception: return 0
 
 
 def _validate_admin_request(request):
