@@ -19,7 +19,7 @@ from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import WebAppInfo
+from aiogram.types import WebAppInfo, MenuButtonWebApp
 
 from config import (
     BOT_TOKEN, ADMIN_ID, WEBAPP_BASE_URL,
@@ -27,7 +27,6 @@ from config import (
 from database import DatabaseManager
 from ai_dispatcher import AIDispatcher
 from billing import BillingManager
-from partner_registration_ai import extract as extract_partner_profile, match_subcategories, missing_question
 from telegram_webapp_auth import TelegramWebAppAuthError, validate_telegram_webapp_init_data
 from stage3_partner_verification import register_stage3_routes
 
@@ -61,6 +60,78 @@ billing_mgr = BillingManager(db)
 
 BASE_DIR = Path(__file__).resolve().parent
 WEB_APPS_DIR = BASE_DIR / "web_apps"
+
+
+def webapp_url(path: str) -> str:
+    return f"{WEBAPP_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+
+
+def get_app_keyboard(path: str, text: str):
+    builder = InlineKeyboardBuilder()
+    builder.button(text=text, web_app=WebAppInfo(url=webapp_url(path)))
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_welcome_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🚀 Բացել Armenia AI Guide / Открыть Armenia AI Guide",
+        web_app=WebAppInfo(url=webapp_url("welcome.html")),
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_client_app_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="👤 Բացել հաճախորդի բաժինը / Открыть раздел клиента",
+        web_app=WebAppInfo(url=webapp_url("client.html")),
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def get_partner_app_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🏢 Բացել գործընկերոջ բաժինը / Открыть раздел партнёра",
+        web_app=WebAppInfo(url=webapp_url("partner.html")),
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+async def api_webapp_set_role(request: web.Request):
+    """Set the selected role from the Welcome WebApp using Telegram initData."""
+    raw = request.headers.get("X-Telegram-Init-Data", "").strip()
+    if not raw:
+        return web.json_response({"ok": False, "error": "telegram_init_data_required"}, status=401)
+    try:
+        telegram_user = validate_telegram_webapp_init_data(raw, BOT_TOKEN)
+        uid = int(telegram_user["id"])
+    except (TelegramWebAppAuthError, KeyError, TypeError, ValueError) as exc:
+        return web.json_response({"ok": False, "error": str(exc) or "invalid_telegram_init_data"}, status=401)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+    role = str(data.get("role") or "").strip().lower()
+    if role not in {"client", "master"}:
+        return web.json_response({"ok": False, "error": "invalid_role"}, status=400)
+
+    user = db.get_user(uid)
+    if not user:
+        db.register_user(uid, telegram_user.get("username") or f"user_{uid}", telegram_user.get("first_name") or "")
+
+    db.update_user_field(uid, "role", role)
+    lang = str(data.get("lang") or "").strip().lower()
+    if lang in {"hy", "ru", "en"}:
+        db.update_user_field(uid, "lang", lang)
+    return web.json_response({"ok": True, "role": role, "telegram_id": uid})
 
 
 
@@ -369,30 +440,27 @@ async def cmd_start(message: types.Message, command: CommandObject, state: FSMCo
 
     if user and user.get("role") is not None:
         role = user["role"]
-        lang = user.get("lang", "hy")
         if role == "master":
             await message.answer(
-                t(lang,
-                  "Բարի գալուստ, Վարպետ: 🛠️\nԴուք պատրաստ եք պատվերներ ընդունել:",
-                  "Добро пожаловать, Мастер! 🛠️\nВы готовы принимать заказы.",
-                  "Welcome, Master! 🛠️\nYou are ready to accept orders."),
-                reply_markup=get_master_menu_keyboard(),
+                "🏢 Armenia AI Guide — Ձեր գործընկերոջ բաժինը\n\nԲացեք ձեր գործընկերոջ էջը՝ շարունակելու աշխատանքը:",
+                reply_markup=get_partner_app_keyboard(),
             )
         else:
             await message.answer(
-                t(lang,
-                  "Բարև Ձեզ! Ինչպե՞ս կարող եմ օգնել: 👤",
-                  "Здравствуйте! Чем я могу помочь? 👤",
-                  "Hello! How can I help you? 👤"),
-                reply_markup=get_client_menu_keyboard(),
+                "👤 Armenia AI Guide — Ձեր AI օգնականը\n\nԲացեք հաճախորդի էջը՝ ծառայություն գտնելու և ամրագրելու համար:",
+                reply_markup=get_client_app_keyboard(),
             )
         return
 
-    # --- Новый пользователь: выбор языка ---
-    await state.set_state(RegistrationStates.choosing_role)
+    # --- Первый вход: всегда красивая Welcome WebApp, без запуска AI-чата. ---
+    await state.clear()
     await message.answer(
-        "🌐 Ընտրեք լեզուն / Выберите язык / Select language:",
-        reply_markup=get_language_keyboard(),
+        "✦ <b>Armenia AI Guide</b>\n"
+        "<i>ARMENIA · AI CONCIERGE</i>\n\n"
+        "Ձեր AI օգնականը ծառայություններ գտնելու, ընտրելու և ամրագրման հարցերում։\n\n"
+        "Սկսելու համար բացեք Armenia AI Guide-ը։ / Откройте Armenia AI Guide, чтобы начать.",
+        reply_markup=get_welcome_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -425,159 +493,77 @@ async def process_role(callback: types.CallbackQuery, state: FSMContext):
             t(lang,
               "🎉 Դուք հաճախորդ եք: Նկարագրեք ձեր խնդիրը, և ԻԻ-ն կգտնի վարպետին:",
               "🎉 Вы — Клиент. Опишите задачу, и ИИ найдёт мастера!",
-              "🎉 You are a Client. Describe your task, and AI will find a provider!"),
+              "🎉 You are a Client. Describe your task and AI will find a master!"),
         )
     elif chosen == "master":
         db.update_user_field(uid, "role", "master")
         await state.set_state(RegistrationStates.choosing_city)
-        await state.update_data(partner_onboarding_history=[])
         await callback.message.edit_text(
             t(lang,
-              "🏢 Գրանցենք ձեր բիզնեսը։ Պատմեք ազատ ձևով՝ ինչ բիզնես ունեք, ինչպես է կոչվում, որտեղ է գտնվում, ինչ ծառայություններ եք մատուցում և ինչ գներով։ Ես ինքս կճանաչեմ ուղղությունը, ենթաուղղությունները և ծառայությունները։",
-              "🏢 Давайте зарегистрируем ваш бизнес. Расскажите свободно: как называется бизнес, где находится, чем вы занимаетесь, какие услуги оказываете и сколько они стоят. Я сам определю направление, подкатегории и услуги.",
-              "🏢 Let’s register your business. Tell me naturally what it is called, where it is located, what you offer and your prices. I will determine the direction, subcategories and services."),
+              "🛠️ Ընտրեք քաղաքը:",
+              "🛠️ Выберите город:",
+              "🛠️ Select your city:"),
+            reply_markup=get_city_keyboard(),
         )
     await callback.answer()
 
 
-async def _partner_onboarding_message(message: types.Message, state: FSMContext):
+@router.message(F.web_app_data)
+async def handle_webapp_data(message: types.Message, state: FSMContext):
+    """Commands sent by role-specific WebApps back to the Telegram bot."""
+    try:
+        payload = json.loads(message.web_app_data.data or "{}")
+    except Exception:
+        payload = {"action": message.web_app_data.data}
+
+    action = str(payload.get("action") or "").strip().lower()
     uid = message.from_user.id
-    user = db.get_user(uid) or {}
-    lang = user.get("lang", "hy")
-    text = (message.text or "").strip()
-    if len(text) < 2:
+    user = db.get_user(uid)
+    lang = (user or {}).get("lang", "hy")
+
+    if action == "partner_register":
+        db.update_user_field(uid, "role", "master")
+        await state.set_state(RegistrationStates.choosing_city)
+        await message.answer(
+            t(lang,
+              "Բարի գալուստ գործընկերների բաժին։ 🏢\n\nՍկսենք բիզնեսի գրանցումը։ Ընտրեք ձեր քաղաքը կամ գրեք այն հաղորդագրությամբ։",
+              "Добро пожаловать в раздел партнёров. 🏢\n\nНачнём регистрацию бизнеса. Выберите город или напишите его сообщением.",
+              "Welcome to the partner section. 🏢\n\nLet's register your business. Choose your city or type it in a message."),
+            reply_markup=get_city_keyboard(),
+        )
         return
 
-    data = await state.get_data()
-    history = data.get("partner_onboarding_history") or []
-    pending_field = data.get("partner_onboarding_pending_field")
-    previous_profile = data.get("partner_profile") or {}
-    history.append({"role": "user", "content": text})
-
-    await bot.send_chat_action(uid, "typing")
-    profile = await extract_partner_profile(text, history, db, previous_profile=previous_profile, pending_field=pending_field)
-
-    # Never lose fields already collected in earlier turns.
-    merged = dict(previous_profile)
-    for key, value in (profile or {}).items():
-        if value not in (None, "", [], {}):
-            merged[key] = value
-    profile = merged
-
-    # If we explicitly asked for one field, the next user message is its answer.
-    if pending_field in {"business_name", "city", "district", "direction"} and text:
-        profile[pending_field] = text.strip()
-    elif pending_field == "services" and text:
-        if not profile.get("services"):
-            profile["services"] = [{"name": text.strip(), "price": None, "price_type": "unknown"}]
-    city_hint = data.get("partner_city_hint")
-    if city_hint and not profile.get("city"):
-        profile["city"] = city_hint
-    # Calculate missing fields ourselves; do not trust an LLM to forget the previous turn.
-    required_missing = []
-    if not profile.get("business_name"): required_missing.append("business_name")
-    if not profile.get("city"): required_missing.append("city")
-    if not profile.get("direction"): required_missing.append("direction")
-    if not profile.get("services"): required_missing.append("services")
-    profile["missing"] = required_missing
-    profile["ready"] = not required_missing
-
-    await state.update_data(partner_onboarding_history=history, partner_profile=profile)
-
-    if not profile.get("ready"):
-        # If the LLM failed to mark ready but all essential fields are present,
-        # let the deterministic check below decide.
-        essential = all(profile.get(k) for k in ("business_name", "city", "direction")) and bool(profile.get("services"))
-        if not essential:
-            question = missing_question(profile, lang)
-            next_field = (profile.get("missing") or [None])[0]
-            await state.update_data(partner_onboarding_pending_field=next_field)
-            history.append({"role": "assistant", "content": question})
-            await state.update_data(partner_onboarding_history=history)
-            await message.answer(
-                t(lang,
-                  f"🤖 Ես արդեն հավաքել եմ ձեր ասած տվյալները։ {question}",
-                  f"🤖 Я уже собрал то, что вы рассказали. {question}",
-                  f"🤖 I have collected the information you gave me. {question}"),
-            )
-            return
-
-    name = str(profile.get("business_name") or "").strip()[:200]
-    city = str(profile.get("city") or "").strip()[:200]
-    direction = str(profile.get("direction") or "").strip()[:200]
-    description = str(profile.get("description") or "").strip()
-    services = profile.get("services") or []
-
-    # Persist the structured profile in the existing partner record.
-    partner = db.get_partner_by_user(uid)
-    if partner:
-        partner_id = partner.get("id")
-        db.update_partner(partner_id, business_name=name, business_description=description, status="pending", verification_status="not_submitted")
-    else:
-        partner_id = db.create_partner(uid)
-        db.update_partner(partner_id, business_name=name, business_description=description, status="pending", verification_status="not_submitted")
-
-    db.update_user_field(uid, "city", city)
-
-    # Map AI-selected subcategories into the existing category system.
-    category_ids = match_subcategories(db, profile.get("subcategory_names") or [])
-    if category_ids:
-        try:
-            db.set_master_categories(uid, category_ids)
-        except Exception:
-            logger.exception("Could not save AI-selected partner categories for %s", uid)
-
-    service_lines = []
-    for item in services:
-        if not isinstance(item, dict):
-            continue
-        n = str(item.get("name") or "").strip()
-        if not n:
-            continue
-        price = item.get("price")
-        if price not in (None, ""):
-            service_lines.append(f"• {n} — {price} ֏")
-        else:
-            service_lines.append(f"• {n}")
-
-    summary = [
-        f"🏢 {name}",
-        f"📍 {city}",
-        f"🧭 {direction}",
-    ]
-    if profile.get("district"):
-        summary.append(f"📌 {profile['district']}")
-    if service_lines:
-        summary.append("\n🛠 Ծառայություններ / Услуги:\n" + "\n".join(service_lines[:20]))
-
-    await state.clear()
-    await message.answer(
-        t(lang,
-          "✅ Բիզնեսի տվյալները ճանաչեցի և պահպանեցի։\n\n" + "\n".join(summary) + "\n\n📄 Հաջորդ քայլը՝ բիզնեսը հաստատելու փաստաթուղթը ուղարկեք գործընկերոջ բաժնում։ Հայտը կգնա ադմինիստրատորի ստուգմանը։",
-          "✅ Я распознал и сохранил данные бизнеса.\n\n" + "\n".join(summary) + "\n\n📄 Следующий шаг — отправьте подтверждающий документ в разделе партнёра. Заявка будет передана администратору на проверку.",
-          "✅ I recognized and saved your business information.\n\n" + "\n".join(summary) + "\n\n📄 Next step: upload the verification document in the partner section. Your application will then go to admin review."),
-    )
+    if action == "client_open":
+        db.update_user_field(uid, "role", "client")
+        await state.clear()
+        await message.answer(
+            t(lang,
+              "👤 Բարի գալուստ։ Բացեք հաճախորդի բաժինը։",
+              "👤 Добро пожаловать. Откройте раздел клиента.",
+              "👤 Welcome. Open the client section."),
+            reply_markup=get_client_app_keyboard(),
+        )
 
 
-# The old city/category button flow is intentionally kept below for compatibility,
-# but free-form partner onboarding is handled first while choosing_city is active.
+# --- Город (быстрый выбор или текстовый ввод) ---
+
 @router.callback_query(RegistrationStates.choosing_city, F.data.startswith("city_"))
 async def process_city_quick(callback: types.CallbackQuery, state: FSMContext):
     city = callback.data.replace("city_", "")
-    await state.update_data(partner_city_hint=city)
-    lang = (db.get_user(callback.from_user.id) or {}).get("lang", "hy")
-    await callback.message.answer(
-        t(lang,
-          f"📍 Գրանցեցի քաղաքը՝ {city}։ Հիմա պատմեք ձեր բիզնեսի մասին՝ անվանումը, ծառայությունները և գները։",
-          f"📍 Город записал: {city}. Теперь расскажите о бизнесе: название, услуги и цены.",
-          f"📍 City saved: {city}. Now tell me about the business: name, services and prices."),
-    )
+    uid = callback.from_user.id
+    db.update_user_field(uid, "city", city)
+    await _show_categories_selection(uid, state, callback.message, city)
     await callback.answer()
 
 
 @router.message(RegistrationStates.choosing_city)
 async def process_city_text(message: types.Message, state: FSMContext):
-    await _partner_onboarding_message(message, state)
+    city = message.text.strip()
+    if len(city) < 2:
+        await message.answer("⚠️ Введите корректный город:")
+        return
+    db.update_user_field(message.from_user.id, "city", city)
+    await _show_categories_selection(message.from_user.id, state, message, city)
 
 
 async def _show_categories_selection(uid: int, state: FSMContext, msg, city: str):
@@ -1599,6 +1585,9 @@ async def main():
         except Exception:
             logger.exception("Не удалось зарегистрировать Partner cabinet API")
 
+    # Welcome WebApp role selection. This endpoint validates Telegram initData.
+    app.router.add_post("/api/webapp/role", api_webapp_set_role)
+
     # Public home page — explicitly serve index.html.
     app.router.add_get("/", serve_index)
 
@@ -1617,6 +1606,18 @@ async def main():
     await site.start()
 
     logger.info("🌐 HTTP-сервер запущен на порту %s", port)
+
+    # Telegram bottom menu: one-tap entry into the beautiful Welcome WebApp.
+    try:
+        await bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(
+                text="Присоединиться",
+                web_app=WebAppInfo(url=webapp_url("welcome.html")),
+            )
+        )
+        logger.info("✅ Telegram bottom menu button configured")
+    except Exception:
+        logger.exception("Не удалось настроить Telegram bottom menu button")
 
     await dp.start_polling(bot)
 
