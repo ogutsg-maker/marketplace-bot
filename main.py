@@ -136,46 +136,66 @@ async def api_webapp_set_role(request: web.Request):
     return web.json_response({"ok": True, "role": role, "telegram_id": uid})
 
 
-async def api_webapp_partner_start(request: web.Request):
-    """Start partner onboarding directly from WebApp without relying on tg.sendData()."""
+async def _webapp_partner_auth(request: web.Request):
     raw = request.headers.get("X-Telegram-Init-Data", "").strip()
     if not raw:
-        return web.json_response({"ok": False, "error": "telegram_init_data_required"}, status=401)
+        raise web.HTTPUnauthorized(text=json.dumps({"ok": False, "error": "telegram_init_data_required"}), content_type="application/json")
     try:
         telegram_user = validate_telegram_webapp_init_data(raw, BOT_TOKEN)
         uid = int(telegram_user["id"])
     except (TelegramWebAppAuthError, KeyError, TypeError, ValueError) as exc:
-        return web.json_response({"ok": False, "error": str(exc) or "invalid_telegram_init_data"}, status=401)
-
+        raise web.HTTPUnauthorized(text=json.dumps({"ok": False, "error": str(exc) or "invalid_telegram_init_data"}), content_type="application/json")
     user = db.get_user(uid)
     if not user:
-        db.register_user(
-            uid,
-            telegram_user.get("username") or f"user_{uid}",
-            telegram_user.get("first_name") or "",
-        )
+        db.register_user(uid, telegram_user.get("username") or f"user_{uid}", telegram_user.get("first_name") or "")
         user = db.get_user(uid) or {}
-
     db.update_user_field(uid, "role", "master")
-    lang = (user or {}).get("lang") or "hy"
+    return uid, user
 
-    # Use the same aiogram FSM storage as normal Telegram messages.
+
+def _partner_state(uid: int):
     key = StorageKey(bot_id=bot.id, chat_id=uid, user_id=uid)
-    state = FSMContext(storage=storage, key=key)
-    await state.clear()
-    await state.set_state(RegistrationStates.choosing_city)
-    await state.update_data(partner_onboarding_history=[], partner_profile={}, partner_onboarding_pending_field=None)
+    return FSMContext(storage=storage, key=key)
 
-    await bot.send_message(
-        uid,
-        t(lang,
-          "🏢 <b>Գրանցենք ձեր բիզնեսը</b>\n\nՊատմեք ազատ ձևով՝ ինչպես է կոչվում բիզնեսը, որտեղ է գտնվում, ինչ ծառայություններ եք մատուցում և ինչ գներով։ Ես կճանաչեմ ուղղությունը, ենթաուղղությունները և ծառայությունները։",
-          "🏢 <b>Зарегистрируем ваш бизнес</b>\n\nРасскажите свободно: как называется бизнес, где находится, какие услуги вы оказываете и какие у них цены. Я сам определю направление, подкатегории и услуги.",
-          "🏢 <b>Let’s register your business</b>\n\nTell me naturally what the business is called, where it is located, what services you offer and their prices. I will determine the direction, subcategories and services."),
-        parse_mode=ParseMode.HTML,
-    )
-    return web.json_response({"ok": True, "started": True, "telegram_id": uid})
 
+async def api_webapp_partner_start(request: web.Request):
+    """Start partner onboarding and keep the conversation inside the WebApp."""
+    uid, user = await _webapp_partner_auth(request)
+    state = _partner_state(uid)
+    current = await state.get_state()
+    if current is None:
+        await state.set_state(RegistrationStates.choosing_city)
+        await state.update_data(partner_onboarding_history=[], partner_profile={}, partner_onboarding_pending_field=None)
+    lang = (user or {}).get("lang") or "hy"
+    return web.json_response({
+        "ok": True,
+        "started": True,
+        "telegram_id": uid,
+        "message": t(lang,
+            "🏢 <b>Գրանցենք ձեր բիզնեսը</b>\n\nՊատմեք ազատ ձևով՝ ինչպես է կոչվում բիզնեսը, որտեղ է գտնվում, ինչ ծառայություններ եք մատուցում և ինչ գներով։ Ես կճանաչեմ ուղղությունը, ենթաուղղությունները և ծառայությունները։",
+            "🏢 <b>Зарегистрируем ваш бизнес</b>\n\nРасскажите свободно: как называется бизнес, где находится, какие услуги вы оказываете и какие у них цены. Я сам определю направление, подкатегории и услуги.",
+            "🏢 <b>Let’s register your business</b>\n\nTell me naturally what the business is called, where it is located, what services you offer and their prices. I will determine the direction, subcategories and services."),
+        "completed": False,
+    })
+
+
+async def api_webapp_partner_message(request: web.Request):
+    """Process one partner onboarding message without leaving the WebApp."""
+    uid, user = await _webapp_partner_auth(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    text = str(payload.get("text") or "").strip()
+    if len(text) < 2:
+        return web.json_response({"ok": False, "error": "message_too_short"}, status=400)
+    state = _partner_state(uid)
+    current = await state.get_state()
+    if current is None:
+        await state.set_state(RegistrationStates.choosing_city)
+        await state.update_data(partner_onboarding_history=[], partner_profile={}, partner_onboarding_pending_field=None)
+    result = await _process_partner_onboarding_text(uid, text, state)
+    return web.json_response({"ok": True, **result})
 
 
 # ─── TELEGRAM WEB APP AUTH / PARTNER GATING ─────────────────────
@@ -591,75 +611,46 @@ async def handle_webapp_data(message: types.Message, state: FSMContext):
         )
 
 
-async def _partner_onboarding_message(message: types.Message, state: FSMContext):
-    uid = message.from_user.id
+async def _process_partner_onboarding_text(uid: int, text: str, state: FSMContext) -> dict:
     user = db.get_user(uid) or {}
     lang = user.get("lang", "hy")
-    text = (message.text or "").strip()
-    if len(text) < 2:
-        return
-
     data = await state.get_data()
     history = data.get("partner_onboarding_history") or []
     pending_field = data.get("partner_onboarding_pending_field")
     previous_profile = data.get("partner_profile") or {}
     history.append({"role": "user", "content": text})
 
-    await bot.send_chat_action(uid, "typing")
     profile = await extract_partner_profile(text, history, db, previous_profile=previous_profile, pending_field=pending_field)
-
-    # Never lose fields already collected in earlier turns.
     merged = dict(previous_profile)
     for key, value in (profile or {}).items():
         if value not in (None, "", [], {}):
             merged[key] = value
     profile = merged
-
-    # If we explicitly asked for one field, the next user message is its answer.
     if pending_field in {"business_name", "city", "district", "direction"} and text:
         profile[pending_field] = text.strip()
-    elif pending_field == "services" and text:
-        if not profile.get("services"):
-            profile["services"] = [{"name": text.strip(), "price": None, "price_type": "unknown"}]
+    elif pending_field == "services" and text and not profile.get("services"):
+        profile["services"] = [{"name": text.strip(), "price": None, "price_type": "unknown"}]
     city_hint = data.get("partner_city_hint")
     if city_hint and not profile.get("city"):
         profile["city"] = city_hint
-    # Calculate missing fields ourselves; do not trust an LLM to forget the previous turn.
-    required_missing = []
-    if not profile.get("business_name"): required_missing.append("business_name")
-    if not profile.get("city"): required_missing.append("city")
-    if not profile.get("direction"): required_missing.append("direction")
-    if not profile.get("services"): required_missing.append("services")
+    required_missing = [k for k in ("business_name", "city", "direction", "services") if not profile.get(k)]
     profile["missing"] = required_missing
     profile["ready"] = not required_missing
-
     await state.update_data(partner_onboarding_history=history, partner_profile=profile)
 
     if not profile.get("ready"):
-        # If the LLM failed to mark ready but all essential fields are present,
-        # let the deterministic check below decide.
-        essential = all(profile.get(k) for k in ("business_name", "city", "direction")) and bool(profile.get("services"))
-        if not essential:
-            question = missing_question(profile, lang)
-            next_field = (profile.get("missing") or [None])[0]
-            await state.update_data(partner_onboarding_pending_field=next_field)
-            history.append({"role": "assistant", "content": question})
-            await state.update_data(partner_onboarding_history=history)
-            await message.answer(
-                t(lang,
-                  f"🤖 Ես արդեն հավաքել եմ ձեր ասած տվյալները։ {question}",
-                  f"🤖 Я уже собрал то, что вы рассказали. {question}",
-                  f"🤖 I have collected the information you gave me. {question}"),
-            )
-            return
+        question = missing_question(profile, lang)
+        next_field = (profile.get("missing") or [None])[0]
+        await state.update_data(partner_onboarding_pending_field=next_field)
+        history.append({"role": "assistant", "content": question})
+        await state.update_data(partner_onboarding_history=history)
+        return {"message": t(lang, f"🤖 Ես արդեն հավաքել եմ ձեր ասած տվյալները։ {question}", f"🤖 Я уже собрал то, что вы рассказали. {question}", f"🤖 I have collected the information you gave me. {question}"), "completed": False, "profile": profile}
 
     name = str(profile.get("business_name") or "").strip()[:200]
     city = str(profile.get("city") or "").strip()[:200]
     direction = str(profile.get("direction") or "").strip()[:200]
     description = str(profile.get("description") or "").strip()
     services = profile.get("services") or []
-
-    # Persist the structured profile in the existing partner record.
     partner = db.get_partner_by_user(uid)
     if partner:
         partner_id = partner.get("id")
@@ -667,17 +658,13 @@ async def _partner_onboarding_message(message: types.Message, state: FSMContext)
     else:
         partner_id = db.create_partner(uid)
         db.update_partner(partner_id, business_name=name, business_description=description, status="pending", verification_status="not_submitted")
-
     db.update_user_field(uid, "city", city)
-
-    # Map AI-selected subcategories into the existing category system.
     category_ids = match_subcategories(db, profile.get("subcategory_names") or [])
     if category_ids:
         try:
             db.set_master_categories(uid, category_ids)
         except Exception:
             logger.exception("Could not save AI-selected partner categories for %s", uid)
-
     service_lines = []
     for item in services:
         if not isinstance(item, dict):
@@ -686,28 +673,29 @@ async def _partner_onboarding_message(message: types.Message, state: FSMContext)
         if not n:
             continue
         price = item.get("price")
-        if price not in (None, ""):
-            service_lines.append(f"• {n} — {price} ֏")
-        else:
-            service_lines.append(f"• {n}")
-
-    summary = [
-        f"🏢 {name}",
-        f"📍 {city}",
-        f"🧭 {direction}",
-    ]
+        service_lines.append(f"• {n} — {price} ֏" if price not in (None, "") else f"• {n}")
+    summary = [f"🏢 {name}", f"📍 {city}", f"🧭 {direction}"]
     if profile.get("district"):
         summary.append(f"📌 {profile['district']}")
     if service_lines:
         summary.append("\n🛠 Ծառայություններ / Услуги:\n" + "\n".join(service_lines[:20]))
+    await state.update_data(partner_onboarding_pending_field=None, partner_profile=profile)
+    return {"message": t(lang,
+        "✅ Բիզնեսի տվյալները ճանաչեցի և պահպանեցի։\n\n" + "\n".join(summary) + "\n\n📄 Հաջորդ քայլը՝ բիզնեսը հաստատելու փաստաթուղթը բեռնեք հենց այս էջում։",
+        "✅ Я распознал и сохранил данные бизнеса.\n\n" + "\n".join(summary) + "\n\n📄 Следующий шаг — загрузите подтверждающий документ прямо на этой странице.",
+        "✅ I recognized and saved your business information.\n\n" + "\n".join(summary) + "\n\n📄 Next step: upload the verification document directly on this page."), "completed": True, "partner_id": partner_id, "profile": profile}
 
-    await state.clear()
-    await message.answer(
-        t(lang,
-          "✅ Բիզնեսի տվյալները ճանաչեցի և պահպանեցի։\n\n" + "\n".join(summary) + "\n\n📄 Հաջորդ քայլը՝ բիզնեսը հաստատելու փաստաթուղթը ուղարկեք գործընկերոջ բաժնում։ Հայտը կգնա ադմինիստրատորի ստուգմանը։",
-          "✅ Я распознал и сохранил данные бизнеса.\n\n" + "\n".join(summary) + "\n\n📄 Следующий шаг — отправьте подтверждающий документ в разделе партнёра. Заявка будет передана администратору на проверку.",
-          "✅ I recognized and saved your business information.\n\n" + "\n".join(summary) + "\n\n📄 Next step: upload the verification document in the partner section. Your application will then go to admin review."),
-    )
+
+async def _partner_onboarding_message(message: types.Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if len(text) < 2:
+        return
+    uid = message.from_user.id
+    await bot.send_chat_action(uid, "typing")
+    result = await _process_partner_onboarding_text(uid, text, state)
+    await message.answer(result["message"], parse_mode=ParseMode.HTML)
+    if result.get("completed"):
+        await state.clear()
 
 
 # --- Город (быстрый выбор или текстовый ввод) ---
@@ -1748,6 +1736,7 @@ async def main():
     # Welcome WebApp role selection. This endpoint validates Telegram initData.
     app.router.add_post("/api/webapp/role", api_webapp_set_role)
     app.router.add_post("/api/webapp/partner/start", api_webapp_partner_start)
+    app.router.add_post("/api/webapp/partner/message", api_webapp_partner_message)
 
     # Public home page — explicitly serve index.html.
     app.router.add_get("/", serve_index)
