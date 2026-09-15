@@ -12,6 +12,11 @@ import runtime_platform_bootstrap  # noqa: F401
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
+# Telegram polling must never compete with an active webhook.
+# The bridge wraps Dispatcher.start_polling and removes any stale webhook
+# immediately before polling starts.
+import polling_bootstrap  # noqa: F401,E402
+
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 if not BOT_TOKEN:
     raise ValueError("TELEGRAM_BOT_TOKEN не задан в .env")
