@@ -8,6 +8,9 @@ from dotenv import load_dotenv
 
 # Load the platform runtime bridge before main creates aiohttp.Application.
 import runtime_platform_bootstrap  # noqa: F401
+# Telegram WebApp entry-point cache bridge. Must be imported after the runtime
+# bridge so it wraps the already-bootstrapped aiohttp Application initializer.
+import admin_webapp_cache_bootstrap  # noqa: F401,E402
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
